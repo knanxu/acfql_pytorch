@@ -9,7 +9,6 @@ import os
 import json
 import random
 import time
-import dataclasses
 
 import torch
 import numpy as np
@@ -158,25 +157,16 @@ def main(_):
     print(f"Observation shape: {observation_shape}")
     print(f"Action dim: {action_dim}")
     
-    # Get agent class and config class
+    # Get agent class
     agent_name = config['agent_name']
-    AgentClass, ConfigClass = get_agent(agent_name)
+    AgentClass, _ = get_agent(agent_name)
     print(f"Using agent: {agent_name} ({AgentClass.__name__})")
     
-    # Build config kwargs from ml_collections config
-    # Get all fields from ConfigClass dataclass
-    config_fields = {f.name for f in dataclasses.fields(ConfigClass)}
+    # Convert ml_collections.ConfigDict to dict for agent
+    # ml_collections.ConfigDict can be converted to dict directly
+    agent_config = dict(config)
     
-    # Only pass parameters that the ConfigClass accepts
-    config_kwargs = {}
-    for key in config.keys():
-        if key in config_fields:
-            config_kwargs[key] = config[key]
-    
-    # Create agent config
-    agent_config = ConfigClass(**config_kwargs)
-    
-    # Create agent
+    # Create agent (agents use dict-based config, not dataclass)
     agent = AgentClass.create(
         observation_shape=observation_shape,
         action_dim=action_dim,

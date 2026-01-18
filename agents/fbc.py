@@ -5,9 +5,9 @@ Adapted from JAX/Flax ACFQLAgent to pure BC with flow matching.
 Keeps critic structure for future RL experiments.
 
 Supports:
-- Multiple encoder types: 'impala', 'resnet18', 'resnet34', 'vit_b_16', or None (state-based)
-- Multiple policy types: 'mlp', 'chiunet', 'chitransformer'
-- Multi-image observations with proprioception
+- Encoder types: 'impala' or 'impala_small' (visual), or None (state-based)
+- Policy types: 'mlp' only (ChiUNet and ChiTransformer not implemented yet)
+- Single image observations (multi-image not implemented yet)
 
 Config is passed as a dictionary (similar to JAX version).
 """
@@ -21,8 +21,6 @@ import torch.optim as optim
 import numpy as np
 
 from utils.model import ActorVectorField, Value, ImpalaEncoder
-from utils.encoders import get_encoder, MultiImageObsEncoder
-from utils.policy_networks import get_policy_network, ChiUNet, ChiTransformer
 
 
 class BCAgent:
@@ -32,10 +30,11 @@ class BCAgent:
     Features:
     - Flow-based action modeling (continuous normalizing flow)
     - Action chunking support (predict multiple future actions)
-    - Multiple visual encoders: IMPALA, ResNet, ViT
-    - Multiple policy networks: MLP, ChiUNet, ChiTransformer
-    - Multi-image + proprioception observations
+    - Visual encoder: IMPALA (single image only)
+    - Policy network: MLP-based ActorVectorField
     - Critic network structure (for future RL fine-tuning)
+    
+    Note: ChiUNet, ChiTransformer, and multi-image encoders are not yet implemented.
     
     Config is passed as a dictionary (similar to JAX version).
     """
@@ -124,7 +123,7 @@ class BCAgent:
             first_key = list(observations.keys())[0]
             batch_size = observations[first_key].shape[0]
         else:
-        batch_size = observations.shape[0]
+            batch_size = observations.shape[0]
         
         # Encode observations if using separate encoder
         obs_emb = self._encode_observations(observations)
@@ -134,76 +133,44 @@ class BCAgent:
         horizon_length = self.config.get('horizon_length', 1)
         
         if self.policy_type in ['chiunet', 'chitransformer']:
-            # ChiUNet/ChiTransformer expect (B, Ta, act_dim)
-            if actions.ndim == 2:
-                # Reshape flat actions to (B, T, act_dim)
-                if actions.shape[-1] == action_dim * horizon_length:
-                    batch_actions = actions.reshape(batch_size, horizon_length, action_dim)
+            raise NotImplementedError(f"Policy type '{self.policy_type}' not implemented yet. Use 'mlp' policy type.")
+        else:
+            # MLP-based policy expects flat (B, act_dim * T)
+            if self.config.get('action_chunking', True):
+                if actions.ndim == 3:
+                    batch_actions = actions.reshape(batch_size, -1)
                 else:
-                    batch_actions = actions.unsqueeze(1)
+                    batch_actions = actions
             else:
-                batch_actions = actions  # Already (B, T, act_dim)
-            
-            Ta = batch_actions.shape[1]
+                if actions.ndim == 3:
+                    batch_actions = actions[:, 0, :]
+                else:
+                    batch_actions = actions
             
             # Flow matching
             x_0 = torch.randn_like(batch_actions)
             x_1 = batch_actions
             
-            t = torch.rand(batch_size, device=self.device)
-            s = torch.zeros_like(t)  # Source time (always 0)
-            
-            t_expand = t.view(batch_size, 1, 1)
-            x_t = (1 - t_expand) * x_0 + t_expand * x_1
+            t = torch.rand(batch_size, 1, device=self.device)
+            x_t = (1 - t) * x_0 + t * x_1
             target_vel = x_1 - x_0
             
-            # Predict velocity
-            pred_vel = self.actor(x_t, s, t, obs_emb)
-            
-            # Compute loss with valid mask
-            if self.config.get('action_chunking', True) and 'valid' in batch:
-                valid = batch['valid']  # (B, T)
-                loss_per_step = ((pred_vel - target_vel) ** 2).mean(dim=-1)  # (B, T)
-                bc_flow_loss = (loss_per_step * valid).sum() / (valid.sum() + 1e-8)
-            else:
-                bc_flow_loss = ((pred_vel - target_vel) ** 2).mean()
-        else:
-            # MLP-based policy expects flat (B, act_dim * T)
-            if self.config.get('action_chunking', True):
-            if actions.ndim == 3:
-                batch_actions = actions.reshape(batch_size, -1)
-            else:
-                batch_actions = actions
-        else:
-            if actions.ndim == 3:
-                batch_actions = actions[:, 0, :]
-            else:
-                batch_actions = actions
-        
-            # Flow matching
-        x_0 = torch.randn_like(batch_actions)
-        x_1 = batch_actions
-        
-        t = torch.rand(batch_size, 1, device=self.device)
-        x_t = (1 - t) * x_0 + t * x_1
-        target_vel = x_1 - x_0
-        
             # Predict velocity (pass encoded observations)
             if self.encoder is not None:
                 pred_vel = self.actor(obs_emb, x_t, t, is_encoded=True)
             else:
-        pred_vel = self.actor(observations, x_t, t)
-        
-        # Compute MSE loss
+                pred_vel = self.actor(observations, x_t, t)
+            
+            # Compute MSE loss
             if self.config.get('action_chunking', True) and 'valid' in batch:
-            valid = batch['valid']  # (B, T)
-            loss_per_element = (pred_vel - target_vel) ** 2
-            loss_per_element = loss_per_element.reshape(
+                valid = batch['valid']  # (B, T)
+                loss_per_element = (pred_vel - target_vel) ** 2
+                loss_per_element = loss_per_element.reshape(
                     batch_size, horizon_length, action_dim
-            )
-            bc_flow_loss = (loss_per_element * valid.unsqueeze(-1)).mean()
-        else:
-            bc_flow_loss = ((pred_vel - target_vel) ** 2).mean()
+                )
+                bc_flow_loss = (loss_per_element * valid.unsqueeze(-1)).mean()
+            else:
+                bc_flow_loss = ((pred_vel - target_vel) ** 2).mean()
         
         total_loss = self.config.get('bc_weight', 1.0) * bc_flow_loss
         
@@ -365,27 +332,18 @@ class BCAgent:
         flow_steps = self.config.get('flow_steps', 10)
         
         if self.policy_type in ['chiunet', 'chitransformer']:
-            # ChiUNet/ChiTransformer: noises shape is (B, Ta, act_dim)
-            actions = noises
-            for i in range(flow_steps):
-                t = torch.full((batch_size,), i / flow_steps, device=self.device)
-                s = torch.zeros_like(t)
-                vels = self.actor(actions, s, t, obs_emb)
-                actions = actions + vels / flow_steps
-            actions = torch.clamp(actions, -1, 1)
-            # Flatten to (B, Ta * act_dim)
-            actions = actions.reshape(batch_size, -1)
+            raise NotImplementedError(f"Policy type '{self.policy_type}' not implemented yet. Use 'mlp' policy type.")
         else:
             # MLP-based policy
-        actions = noises
+            actions = noises
             for i in range(flow_steps):
                 t = torch.full((batch_size, 1), i / flow_steps, device=self.device)
                 if self.encoder is not None:
                     vels = self.actor(obs_emb, actions, t, is_encoded=True)
                 else:
-            vels = self.actor(observations, actions, t)
+                    vels = self.actor(observations, actions, t)
                 actions = actions + vels / flow_steps
-        actions = torch.clamp(actions, -1, 1)
+            actions = torch.clamp(actions, -1, 1)
         
         return actions
 
@@ -424,16 +382,15 @@ class BCAgent:
                 observations = {k: v.unsqueeze(0) for k, v in observations.items()}
             batch_size = observations[first_key].shape[0]
         else:
-        if observations.ndim == 1:
-            observations = observations.unsqueeze(0)
+            if observations.ndim == 1:
+                observations = observations.unsqueeze(0)
             batch_size = observations.shape[0]
         
         action_dim = self.config['action_dim']
         horizon_length = self.config.get('horizon_length', 1)
         
         if self.policy_type in ['chiunet', 'chitransformer']:
-            # Start with noise in (B, Ta, act_dim) format
-            actions = torch.randn(batch_size, horizon_length, action_dim, device=self.device)
+            raise NotImplementedError(f"Policy type '{self.policy_type}' not implemented yet. Use 'mlp' policy type.")
         else:
             # Start with noise in flat format
             full_action_dim = action_dim * horizon_length if self.config.get('action_chunking', True) else action_dim
@@ -498,8 +455,8 @@ class BCAgent:
                 - For multi-image: shape_meta dict (from robomimic_image_utils)
             action_dim: Dimension of action space
             config: Agent configuration dictionary with keys:
-                - encoder_type: 'impala', 'resnet18', 'resnet34', 'vit_b_16', or None
-                - policy_type: 'mlp', 'chiunet', 'chitransformer'
+                - encoder_type: 'impala', 'impala_small', or None (only IMPALA supported)
+                - policy_type: 'mlp' (only MLP supported currently)
                 - emb_dim: Encoder output dimension (default 256)
                 - horizon_length: Action chunking length
                 - action_chunking: Enable action chunking
@@ -540,34 +497,21 @@ class BCAgent:
         
         if is_visual and encoder_type is not None:
             if is_multi_image:
-                # Multi-image encoder
-                encoder = MultiImageObsEncoder(
-                    shape_meta=observation_shape,
-                    rgb_encoder_type=encoder_type,
-                    emb_dim=emb_dim,
-                    resize_shape=config.get('resize_shape'),
-                    crop_shape=config.get('crop_shape'),
-                    random_crop=config.get('random_crop', True),
-                    share_rgb_model=config.get('share_rgb_model', False),
-                    impala_width=config.get('impala_width', 1),
-                    impala_stack_sizes=config.get('impala_stack_sizes', (16, 32, 32)),
-                    impala_num_blocks=config.get('impala_num_blocks', 2),
-                    impala_mlp_hidden_dims=config.get('impala_mlp_hidden_dims', (512,)),
-                )
-                network_input_dim = encoder.output_dim
+                raise NotImplementedError("Multi-image encoder not implemented yet. Use single image observations.")
             else:
-                # Single image encoder
-                encoder = get_encoder(
-                    encoder_type=encoder_type,
-                    input_shape=observation_shape,
-                    output_dim=emb_dim,
-                    width=config.get('impala_width', 1),
-                    stack_sizes=config.get('impala_stack_sizes', (16, 32, 32)),
-                    num_blocks=config.get('impala_num_blocks', 2),
-                    mlp_hidden_dims=config.get('impala_mlp_hidden_dims', (512,)),
-                    layer_norm=config.get('layer_norm', False),
-                )
-            network_input_dim = encoder.output_dim
+                # Single image encoder - only support IMPALA for now
+                if encoder_type == 'impala' or encoder_type == 'impala_small':
+                    encoder = ImpalaEncoder(
+                        input_shape=observation_shape,
+                        width=config.get('impala_width', 1),
+                        stack_sizes=config.get('impala_stack_sizes', (16, 32, 32)),
+                        num_blocks=config.get('impala_num_blocks', 2),
+                        mlp_hidden_dims=config.get('impala_mlp_hidden_dims', (512,)),
+                        layer_norm=config.get('layer_norm', False),
+                    )
+                    network_input_dim = encoder.output_dim
+                else:
+                    raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'impala' or 'impala_small' are supported.")
         elif not is_visual:
             network_input_dim = observation_shape[0]
         else:
@@ -581,63 +525,39 @@ class BCAgent:
         
         # Create policy network based on type
         if policy_type == 'chiunet':
-            actor = ChiUNet(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config.get('obs_steps', 1),
-                model_dim=config.get('model_dim', 256),
-                emb_dim=config.get('time_emb_dim', 256),
-                kernel_size=config.get('kernel_size', 5),
-                cond_predict_scale=config.get('cond_predict_scale', True),
-                dim_mult=config.get('dim_mult', [1, 2, 2]),
-                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
-            )
+            raise NotImplementedError("ChiUNet policy not implemented yet. Use 'mlp' policy type.")
         elif policy_type == 'chitransformer':
-            actor = ChiTransformer(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config.get('obs_steps', 1),
-                d_model=config.get('d_model', 256),
-                nhead=config.get('nhead', 4),
-                num_layers=config.get('num_layers', 8),
-                p_drop_emb=config.get('p_drop_emb', 0.0),
-                p_drop_attn=config.get('p_drop_attn', 0.3),
-                n_cond_layers=config.get('n_cond_layers', 0),
-                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
-            )
+            raise NotImplementedError("ChiTransformer policy not implemented yet. Use 'mlp' policy type.")
         else:
             # MLP-based ActorVectorField
             # If using separate encoder, don't pass it to actor
-        actor = ActorVectorField(
-            observation_dim=network_input_dim,
-            action_dim=full_action_dim,
-            hidden_dim=config.get('actor_hidden_dims', (512, 512, 512, 512)),
-                encoder=None if encoder is not None else None,  # Encoder is separate
-            use_fourier_features=config.get('use_fourier_features', False),
-            fourier_feature_dim=config.get('fourier_feature_dim', 64),
-        )
+            actor = ActorVectorField(
+                observation_dim=network_input_dim,
+                action_dim=full_action_dim,
+                hidden_dim=config.get('actor_hidden_dims', (512, 512, 512, 512)),
+                encoder=None,  # Encoder is separate
+                use_fourier_features=config.get('use_fourier_features', False),
+                fourier_feature_dim=config.get('fourier_feature_dim', 64),
+            )
         
         # Create critic encoder (separate from actor encoder)
         critic_encoder = None
         if is_visual and encoder_type is not None:
             if is_multi_image:
-                critic_encoder = MultiImageObsEncoder(
-                    shape_meta=observation_shape,
-                    rgb_encoder_type=encoder_type,
-                    emb_dim=emb_dim,
-                    resize_shape=config.get('resize_shape'),
-                    crop_shape=config.get('crop_shape'),
-                    random_crop=False,  # No augmentation for critic
-                    share_rgb_model=config.get('share_rgb_model', False),
-                )
+                raise NotImplementedError("Multi-image encoder not implemented yet. Use single image observations.")
             else:
-                critic_encoder = get_encoder(
-                    encoder_type=encoder_type,
-                    input_shape=observation_shape,
-                    output_dim=emb_dim,
-                )
+                # Single image encoder - only support IMPALA for now
+                if encoder_type == 'impala' or encoder_type == 'impala_small':
+                    critic_encoder = ImpalaEncoder(
+                        input_shape=observation_shape,
+                        width=config.get('impala_width', 1),
+                        stack_sizes=config.get('impala_stack_sizes', (16, 32, 32)),
+                        num_blocks=config.get('impala_num_blocks', 2),
+                        mlp_hidden_dims=config.get('impala_mlp_hidden_dims', (512,)),
+                        layer_norm=config.get('layer_norm', False),
+                    )
+                else:
+                    raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'impala' or 'impala_small' are supported.")
         
         # Create critic
         critic = Value(
