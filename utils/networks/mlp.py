@@ -68,6 +68,15 @@ class ActorVectorField(nn.Module):
         else:
             observations = o
 
+        # Handle dimension mismatch when observations is 3D (has sequence dimension)
+        # observations: (B, obs_dim) or (B, seq_len, obs_dim)
+        # x_t: (B, action_dim)
+        # t: (B, 1) or (B, time_dim)
+        if observations.dim() == 3:
+            # (B, seq_len, obs_dim) -> (B, seq_len * obs_dim)
+            batch_size = observations.shape[0]
+            observations = observations.reshape(batch_size, -1)
+
         if self.use_time and t is not None:
             if not isinstance(t, torch.Tensor):
                 t = torch.tensor(t, device=observations.device).float()

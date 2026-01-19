@@ -100,6 +100,19 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def batch_to_torch(batch):
+    """Convert batch to torch tensors, handling dict observations."""
+    def to_torch(x):
+        if isinstance(x, dict):
+            return {k: to_torch(v) for k, v in x.items()}
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).float()
+        else:
+            return x
+
+    return {k: to_torch(v) for k, v in batch.items()}
+
+
 def process_train_dataset(ds, env_name, dataset_proportion=1.0, sparse=False):
     """
     Process the training dataset.
@@ -166,9 +179,23 @@ def main(_):
     
     # Get example batch for agent creation
     example_batch = train_dataset.sample(1)
-    observation_shape = example_batch['observations'].shape[1:]  # Remove batch dim
+
+    # Handle dict observations (image environments) vs tensor observations
+    if isinstance(example_batch['observations'], dict):
+        # Image environment with dict observations - use shape_meta
+        observation_shape = env.shape_meta if hasattr(env, 'shape_meta') else None
+        if observation_shape is None:
+            # Try to get from dataset
+            from envs.robomimic_image_utils import get_shape_meta_from_dataset
+            observation_shape = get_shape_meta_from_dataset(
+                dataset_path=train_dataset.dataset_path if hasattr(train_dataset, 'dataset_path') else None,
+                obs_keys=list(example_batch['observations'].keys())
+            )
+    else:
+        observation_shape = example_batch['observations'].shape[1:]  # Remove batch dim
+
     action_dim = example_batch['actions'].shape[-1]
-    
+
     print(f"Observation shape: {observation_shape}")
     print(f"Action dim: {action_dim}")
     
@@ -230,10 +257,10 @@ def main(_):
             sequence_length=config['horizon_length'],
             discount=config['discount']
         )
-        
+
         # Convert to torch tensors
-        batch = {k: torch.from_numpy(v).float() for k, v in batch.items()}
-        
+        batch = batch_to_torch(batch)
+
         # Update agent
         info = agent.update(batch)
         
@@ -340,14 +367,19 @@ def main(_):
                     sequence_length=config['horizon_length'],
                     discount=config['discount']
                 )
-                
+
                 # Convert to torch tensors
-                batch = {k: torch.from_numpy(v).float() for k, v in batch.items()}
-                
+                batch = batch_to_torch(batch)
+
                 # Reshape for UTD ratio
                 if FLAGS.utd_ratio > 1:
-                    batch = {k: v.reshape(FLAGS.utd_ratio, config['batch_size'], *v.shape[1:]) 
-                             for k, v in batch.items()}
+                    def reshape_for_utd(x):
+                        if isinstance(x, dict):
+                            return {k: reshape_for_utd(v) for k, v in x.items()}
+                        else:
+                            return x.reshape(FLAGS.utd_ratio, config['batch_size'], *x.shape[1:])
+
+                    batch = {k: reshape_for_utd(v) for k, v in batch.items()}
                     _, update_info["online_agent"] = agent.batch_update(batch)
                 else:
                     update_info["online_agent"] = agent.update(batch)

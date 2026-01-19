@@ -147,8 +147,32 @@ def replace_submodules(
 
 
 def get_resnet(name, weights=None, **kwargs):
-    """Get ResNet model with identity final layer."""
+    """Get ResNet model with identity final layer.
+
+    Args:
+        name: ResNet model name ('resnet18', 'resnet34', 'resnet50', etc.)
+        weights: Pretrained weights. Options:
+            - None: Random initialization
+            - 'IMAGENET1K_V1': ImageNet pretrained weights (default for torchvision)
+            - 'DEFAULT': Use default pretrained weights
+            - torchvision.models.ResNet18_Weights.IMAGENET1K_V1: Explicit weights object
+
+    Returns:
+        ResNet model with identity final layer (no classification head)
+    """
     func = getattr(torchvision.models, name)
+
+    # Handle weights parameter for backward compatibility
+    if weights == 'IMAGENET1K_V1' or weights == 'DEFAULT':
+        # Get the default pretrained weights for this model
+        weights_enum_name = f"{name.upper()}_Weights"
+        if hasattr(torchvision.models, weights_enum_name):
+            weights_enum = getattr(torchvision.models, weights_enum_name)
+            weights = weights_enum.IMAGENET1K_V1
+        else:
+            # Fallback for older torchvision versions
+            weights = 'IMAGENET1K_V1'
+
     resnet = func(weights=weights, **kwargs)
     resnet.fc = torch.nn.Identity()
     return resnet
@@ -197,7 +221,11 @@ class CropRandomizer(nn.Module):
 
 
 class MultiImageObsEncoder(nn.Module):
-    """Multi-modal observation encoder supporting both RGB and low-dim inputs."""
+    """Multi-modal observation encoder supporting both RGB and low-dim inputs.
+
+    Supports pretrained vision encoders (e.g., ImageNet-pretrained ResNet) and
+    optional freezing of encoder parameters for sample-efficient training.
+    """
 
     def __init__(
         self,
@@ -212,7 +240,26 @@ class MultiImageObsEncoder(nn.Module):
         imagenet_norm: bool = False,
         use_seq=False,
         keep_horizon_dims=False,
+        pretrained: bool = True,
+        freeze_rgb_encoder: bool = True,
     ):
+        """Initialize multi-modal observation encoder.
+
+        Args:
+            shape_meta: Shape metadata dict
+            rgb_model_name: ResNet model name ('resnet18', 'resnet34', 'resnet50')
+            emb_dim: Output embedding dimension
+            resize_shape: Optional resize shape for images
+            crop_shape: Optional crop shape for images
+            random_crop: Use random crop during training
+            use_group_norm: Replace BatchNorm with GroupNorm
+            share_rgb_model: Share RGB encoder across multiple cameras
+            imagenet_norm: Use ImageNet normalization
+            use_seq: Handle sequential observations
+            keep_horizon_dims: Keep horizon dimensions in output
+            pretrained: Load pretrained ImageNet weights (default: True)
+            freeze_rgb_encoder: Freeze RGB encoder parameters (default: True)
+        """
         super().__init__()
         rgb_keys = []
         low_dim_keys = []
@@ -220,9 +267,15 @@ class MultiImageObsEncoder(nn.Module):
         key_transform_map = nn.ModuleDict()
         key_shape_map = {}
 
-        # Get RGB model
+        self.pretrained = pretrained
+        self.freeze_rgb_encoder = freeze_rgb_encoder
+
+        # Get RGB model with optional pretrained weights
         if "resnet" in rgb_model_name:
-            rgb_model = get_resnet(rgb_model_name)
+            weights = 'IMAGENET1K_V1' if pretrained else None
+            rgb_model = get_resnet(rgb_model_name, weights=weights)
+            if pretrained:
+                print(f"✓ Loaded pretrained {rgb_model_name} weights from ImageNet")
         else:
             raise ValueError(f"Unsupported rgb_model: {rgb_model_name}")
 
@@ -316,12 +369,50 @@ class MultiImageObsEncoder(nn.Module):
         self.use_seq = use_seq
         self.keep_horizon_dims = keep_horizon_dims
 
+        # Freeze RGB encoder if requested
+        if freeze_rgb_encoder:
+            self._freeze_rgb_encoder()
+            print(f"✓ Froze RGB encoder parameters (only MLP projection will be trained)")
+
         # MLP to project concatenated features to emb_dim
+        # This MLP is always trainable, even when RGB encoder is frozen
         self.mlp = nn.Sequential(
             nn.Linear(self.output_shape(), emb_dim),
             nn.LeakyReLU(),
             nn.Linear(emb_dim, emb_dim),
         )
+
+        # Set output_dim based on use_seq and keep_horizon_dims
+        if use_seq and not keep_horizon_dims:
+            # When flattening sequence, output_dim is emb_dim * seq_len
+            # But we don't know seq_len here, so we set it to emb_dim
+            # The actual output will be (batch, seq_len * emb_dim)
+            self.output_dim = emb_dim  # Base dimension per timestep
+            self._base_output_dim = emb_dim
+        else:
+            self.output_dim = emb_dim
+            self._base_output_dim = emb_dim
+
+    def _freeze_rgb_encoder(self):
+        """Freeze all RGB encoder parameters."""
+        for key in self.rgb_keys:
+            if key in self.key_model_map:
+                for param in self.key_model_map[key].parameters():
+                    param.requires_grad = False
+        if self.share_rgb_model and "rgb" in self.key_model_map:
+            for param in self.key_model_map["rgb"].parameters():
+                param.requires_grad = False
+
+    def unfreeze_rgb_encoder(self):
+        """Unfreeze all RGB encoder parameters (for fine-tuning)."""
+        for key in self.rgb_keys:
+            if key in self.key_model_map:
+                for param in self.key_model_map[key].parameters():
+                    param.requires_grad = True
+        if self.share_rgb_model and "rgb" in self.key_model_map:
+            for param in self.key_model_map["rgb"].parameters():
+                param.requires_grad = True
+        print("✓ Unfroze RGB encoder parameters")
 
     def multi_image_forward(self, obs_dict):
         """Process multi-modal observations."""

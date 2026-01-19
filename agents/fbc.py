@@ -580,14 +580,24 @@ class BCAgent:
         weight_decay = config.get('weight_decay', 0.0)
 
         # Collect parameters for actor optimizer (includes encoder)
+        # Only include parameters that require gradients (exclude frozen encoder)
         actor_params = list(actor.parameters())
         if encoder is not None:
-            actor_params += list(encoder.parameters())
+            encoder_params = [p for p in encoder.parameters() if p.requires_grad]
+            actor_params += encoder_params
+
+            # Print parameter counts
+            total_encoder_params = sum(p.numel() for p in encoder.parameters())
+            trainable_encoder_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+            if trainable_encoder_params < total_encoder_params:
+                print(f"  Encoder: {trainable_encoder_params:,} / {total_encoder_params:,} parameters trainable "
+                      f"({100 * trainable_encoder_params / total_encoder_params:.1f}%)")
 
         # Collect parameters for critic optimizer
         critic_params = list(critic.parameters())
         if critic_encoder is not None:
-            critic_params += list(critic_encoder.parameters())
+            critic_encoder_params = [p for p in critic_encoder.parameters() if p.requires_grad]
+            critic_params += critic_encoder_params
 
         if weight_decay > 0:
             actor_optimizer = optim.AdamW(actor_params, lr=lr, weight_decay=weight_decay)
@@ -626,6 +636,8 @@ def get_config():
 
             # Image encoder specific
             rgb_model_name='resnet18',  # ResNet model: 'resnet18', 'resnet34', 'resnet50'
+            pretrained_encoder=True,  # Load pretrained ImageNet weights
+            freeze_encoder=True,  # Freeze encoder parameters (only train MLP projection)
             resize_shape=None,  # Optional image resize (H, W)
             crop_shape=None,  # Optional crop for augmentation (H, W)
             random_crop=True,  # Enable random crop augmentation
@@ -657,11 +669,13 @@ def get_config():
             attention=False,
 
             # Time embedding
-            timestep_emb_type='positional',
+            time_encoder='sinusoidal',  # Time encoder: None, 'sinusoidal', 'fourier', 'positional'
+            time_encoder_dim=64,  # Time embedding dimension
+            timestep_emb_type='positional',  # For U-Net/Transformer networks
             timestep_emb_params=None,
-            disable_time_embedding=False,
-            use_fourier_features=False,
-            fourier_feature_dim=64,
+            disable_time_embedding=True,
+            use_fourier_features=False,  # Legacy parameter (use time_encoder='fourier' instead)
+            fourier_feature_dim=64,  # Legacy parameter (use time_encoder_dim instead)
 
             # Critic configuration
             value_hidden_dims=(512, 512, 512, 512),

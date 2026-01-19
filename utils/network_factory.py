@@ -33,6 +33,17 @@ def get_network(config: dict):
     To = config.get('obs_steps', 1)
 
     if network_type == 'mlp':
+        # Get time encoder configuration
+        time_encoder = config.get('time_encoder', 'sinusoidal')
+        time_encoder_dim = config.get('time_encoder_dim', 64)
+
+        # Handle legacy parameters
+        if config.get('disable_time_embedding', False):
+            time_encoder = None
+        elif config.get('use_fourier_features', False):
+            time_encoder = 'fourier'
+            time_encoder_dim = config.get('fourier_feature_dim', 64)
+
         # Check if this is IMFBC/MFBC agent which needs MeanActorVectorField
         agent_name = config.get('agent_name', '')
         if agent_name in ['imfbc', 'mfbc']:
@@ -41,6 +52,8 @@ def get_network(config: dict):
                 observation_dim=obs_dim * To,  # Flatten observation sequence
                 action_dim=act_dim * Ta,  # Flatten action sequence
                 hidden_dim=config.get('actor_hidden_dims', (512, 512, 512, 512)),
+                time_encoder=time_encoder,
+                time_encoder_dim=time_encoder_dim,
                 use_fourier_features=config.get('use_fourier_features', False),
                 fourier_feature_dim=config.get('fourier_feature_dim', 64),
             )
@@ -50,6 +63,8 @@ def get_network(config: dict):
                 observation_dim=obs_dim * To,  # Flatten observation sequence
                 action_dim=act_dim * Ta,  # Flatten action sequence
                 hidden_dim=config.get('actor_hidden_dims', (512, 512, 512, 512)),
+                time_encoder=time_encoder,
+                time_encoder_dim=time_encoder_dim,
                 use_fourier_features=config.get('use_fourier_features', False),
                 fourier_feature_dim=config.get('fourier_feature_dim', 64),
             )
@@ -155,6 +170,19 @@ def get_encoder(config: dict):
         if 'shape_meta' not in config:
             raise ValueError("shape_meta required for image encoder")
 
+        # Determine if we should keep horizon dims based on obs_steps and network type
+        obs_steps = config.get('obs_steps', 1)
+        network_type = config.get('network_type', 'mlp')
+
+        # For networks with global conditioning (ChiUNet, ChiTransformer), flatten the sequence
+        # For obs_steps=1, we don't need sequence dimension
+        if obs_steps == 1 or network_type in ['chiunet', 'chitransformer', 'jannerunet']:
+            keep_horizon_dims = False
+            use_seq = obs_steps > 1  # Only use seq mode if obs_steps > 1
+        else:
+            keep_horizon_dims = config.get('keep_horizon_dims', True)
+            use_seq = config.get('use_seq', True)
+
         return MultiImageObsEncoder(
             shape_meta=config['shape_meta'],
             rgb_model_name=config.get('rgb_model_name', 'resnet18'),
@@ -165,8 +193,10 @@ def get_encoder(config: dict):
             use_group_norm=config.get('use_group_norm', True),
             share_rgb_model=config.get('share_rgb_model', False),
             imagenet_norm=config.get('imagenet_norm', False),
-            use_seq=config.get('use_seq', True),
-            keep_horizon_dims=config.get('keep_horizon_dims', True),
+            use_seq=use_seq,
+            keep_horizon_dims=keep_horizon_dims,
+            pretrained=config.get('pretrained_encoder', True),
+            freeze_rgb_encoder=config.get('freeze_encoder', True),
         )
 
     else:

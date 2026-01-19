@@ -197,11 +197,19 @@ class LazyImageDataset:
         start_indices = np.random.randint(0, max_start + 1, size=batch_size)
 
         # Build sequences
-        observations = {}
+        initial_observations = {}
+        full_observations = {}
         actions_seq = []
         valid_mask = []
 
         for start_idx in start_indices:
+            # Load initial observation (first timestep only)
+            initial_obs = self._load_observation(start_idx)
+            for key in initial_obs.keys():
+                if key not in initial_observations:
+                    initial_observations[key] = []
+                initial_observations[key].append(initial_obs[key])
+
             # Load observation sequence
             seq_obs = {}
             seq_actions = []
@@ -235,19 +243,23 @@ class LazyImageDataset:
 
             # Stack sequence for this batch element
             for key in seq_obs.keys():
-                if key not in observations:
-                    observations[key] = []
-                observations[key].append(np.stack(seq_obs[key], axis=0))
+                if key not in full_observations:
+                    full_observations[key] = []
+                full_observations[key].append(np.stack(seq_obs[key], axis=0))
 
             actions_seq.append(np.stack(seq_actions, axis=0))
             valid_mask.append(np.array(seq_valid))
 
         # Stack batch
-        for key in observations.keys():
-            observations[key] = np.stack(observations[key], axis=0)
+        for key in initial_observations.keys():
+            initial_observations[key] = np.stack(initial_observations[key], axis=0)
+
+        for key in full_observations.keys():
+            full_observations[key] = np.stack(full_observations[key], axis=0)
 
         batch = {
-            'observations': observations,
+            'observations': initial_observations,  # Initial obs: [B, C, H, W]
+            'full_observations': full_observations,  # Full sequence: [B, T, C, H, W]
             'actions': np.stack(actions_seq, axis=0),
             'valid': np.stack(valid_mask, axis=0),
         }

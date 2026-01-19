@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# from helpers import SinusoidalPosEmb
+from utils.embeddings import get_timestep_embedding
 
 
 
@@ -297,44 +297,61 @@ class Value(nn.Module):
     
 class ActorVectorField(nn.Module):
     """Actor vector field network for flow matching.
-    
-    Supports optional time conditioning (times=None means no time input).
-    This matches JAX behavior where actor_onestep_flow doesn't use time.
+
+    Supports optional time conditioning with configurable time encoders.
+
+    Args:
+        observation_dim: Dimension of observations
+        action_dim: Dimension of actions
+        hidden_dim: Hidden layer dimensions for MLP
+        encoder: Optional observation encoder
+        time_encoder: Type of time encoding. Options:
+            - None: No time conditioning (use_time=False)
+            - "sinusoidal": Sinusoidal positional embeddings (default)
+            - "fourier": Random Fourier features
+            - "positional": Learnable positional embeddings
+        time_encoder_dim: Dimension of time embeddings (default: 64)
+        use_time: Whether to use time conditioning (deprecated, use time_encoder=None instead)
     """
     def __init__(self, observation_dim, action_dim, hidden_dim=(512,512,512,512),
-                 encoder=None, use_fourier_features=False, fourier_feature_dim=64,
-                 use_time=True):  # New parameter to control time input
+                 encoder=None, time_encoder="sinusoidal", time_encoder_dim=64,
+                 use_fourier_features=False, fourier_feature_dim=64,
+                 use_time=True):
         super(ActorVectorField, self).__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
-        self.use_fourier_features = use_fourier_features
-        self.use_time = use_time  # Whether this network uses time input
         self.encoder = encoder
-        
+
+        # Handle legacy parameters
+        if not use_time:
+            time_encoder = None
+        elif use_fourier_features and time_encoder == "sinusoidal":
+            time_encoder = "fourier"
+            time_encoder_dim = fourier_feature_dim
+
+        self.time_encoder_type = time_encoder
+        self.use_time = time_encoder is not None
+
         if self.encoder is not None:
             self.input_dim = self.encoder.output_dim
         else:
             self.input_dim = observation_dim
-        
+
         # Add action dimension
         self.input_dim += self.action_dim
-        
-        # Only add time dimension if use_time=True
+
+        # Setup time encoder
         if self.use_time:
-            if self.use_fourier_features:
-                self.ff = FourierFeatures(fourier_feature_dim)
-                self.input_dim += fourier_feature_dim
-            else:
-                self.ff = None
-                self.input_dim += 1
+            self.time_encoder = get_timestep_embedding(time_encoder, time_encoder_dim)
+            self.input_dim += time_encoder_dim
         else:
-            self.ff = None
-        
+            self.time_encoder = None
+
         self.mlp = MLP(self.input_dim, self.action_dim, hidden_dim=hidden_dim)
     
     def forward(self, o, x_t, t=None, is_encoded=False):
         """Forward pass.
-        
+
         Args:
             o: observations
             x_t: noisy actions
@@ -345,20 +362,20 @@ class ActorVectorField(nn.Module):
             observations = self.encoder(o)
         else:
             observations = o
-        
+
         if self.use_time and t is not None:
             if not isinstance(t, torch.Tensor):
                 t = torch.tensor(t, device=observations.device).float()
-            
-            if self.use_fourier_features:
-                if t.dim() == 1: 
-                    t = t.unsqueeze(-1)
-                time_emb = self.ff(t)
-            else:
-                if t.dim() == 1: 
-                    t = t.unsqueeze(-1)
-                time_emb = t
-            
+
+            # Ensure t is 1D for time encoder
+            if t.dim() == 0:
+                t = t.unsqueeze(0)
+            elif t.dim() > 1:
+                t = t.squeeze()
+
+            # Apply time encoder
+            time_emb = self.time_encoder(t)
+
             inputs = torch.cat([observations, x_t, time_emb], dim=-1)
         else:
             # No time input - just concat observations and actions
@@ -369,30 +386,59 @@ class ActorVectorField(nn.Module):
 
 
 class MeanActorVectorField(nn.Module):
-    """Actor vector field with t_begin and t_end time conditioning (for JVP-based flow matching)."""
-    
-    def __init__(self, observation_dim, action_dim, hidden_dim=(512,512,512,512), encoder=None, use_fourier_features=False, fourier_feature_dim=64):
+    """Actor vector field with t_begin and t_end time conditioning (for JVP-based flow matching).
+
+    Args:
+        observation_dim: Dimension of observations
+        action_dim: Dimension of actions
+        hidden_dim: Hidden layer dimensions for MLP
+        encoder: Optional observation encoder
+        time_encoder: Type of time encoding. Options:
+            - "sinusoidal": Sinusoidal positional embeddings (default)
+            - "fourier": Random Fourier features
+            - "positional": Learnable positional embeddings
+        time_encoder_dim: Dimension of time embeddings (default: 64)
+    """
+
+    def __init__(self, observation_dim, action_dim, hidden_dim=(512,512,512,512),
+                 encoder=None, time_encoder="sinusoidal", time_encoder_dim=64,
+                 use_fourier_features=False, fourier_feature_dim=64):
         super(MeanActorVectorField, self).__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
-        self.use_fourier_features = use_fourier_features
         self.encoder = encoder
-        
+
+        # Handle legacy parameters
+        if use_fourier_features and time_encoder == "sinusoidal":
+            time_encoder = "fourier"
+            time_encoder_dim = fourier_feature_dim
+
+        self.time_encoder_type = time_encoder
+
         if self.encoder is not None:
             self.input_dim = self.encoder.output_dim
         else:
             self.input_dim = observation_dim
-        
-        if self.use_fourier_features:
-            self.ff = FourierFeatures(fourier_feature_dim)
-            self.input_dim += self.action_dim + fourier_feature_dim * 2  # two time embeddings
-        else:
-            self.ff = None
-            self.input_dim += self.action_dim + 2  # t_begin and t_end
-        
+
+        # Create time encoders for t_begin and t_end
+        self.time_encoder_begin = get_timestep_embedding(time_encoder, time_encoder_dim)
+        self.time_encoder_end = get_timestep_embedding(time_encoder, time_encoder_dim)
+
+        # Input: observations + actions + time_begin_emb + time_end_emb
+        self.input_dim += self.action_dim + time_encoder_dim * 2
+
         self.mlp = MLP(self.input_dim, self.action_dim, hidden_dim=hidden_dim)
-    
+
     def forward(self, observations, x_t, t_begin, t_end, is_encoded=False):
+        """Forward pass.
+
+        Args:
+            observations: Observation tensor
+            x_t: Noisy actions
+            t_begin: Begin time for JVP computation
+            t_end: End time for JVP computation
+            is_encoded: Whether observations are already encoded
+        """
         if not is_encoded and self.encoder is not None:
             observations = self.encoder(observations)
 
@@ -400,12 +446,23 @@ class MeanActorVectorField(nn.Module):
             t_begin = torch.tensor(t_begin, device=observations.device).float()
         if not isinstance(t_end, torch.Tensor):
             t_end = torch.tensor(t_end, device=observations.device).float()
-        
-        if self.use_fourier_features:
-            t_begin = self.ff(t_begin)
-            t_end = self.ff(t_end)
-            
-        inputs = torch.cat([observations, x_t, t_begin,t_end], dim=-1)
+
+        # Ensure times are 1D for time encoder
+        if t_begin.dim() == 0:
+            t_begin = t_begin.unsqueeze(0)
+        elif t_begin.dim() > 1:
+            t_begin = t_begin.squeeze()
+
+        if t_end.dim() == 0:
+            t_end = t_end.unsqueeze(0)
+        elif t_end.dim() > 1:
+            t_end = t_end.squeeze()
+
+        # Apply time encoders
+        t_begin_emb = self.time_encoder_begin(t_begin)
+        t_end_emb = self.time_encoder_end(t_end)
+
+        inputs = torch.cat([observations, x_t, t_begin_emb, t_end_emb], dim=-1)
 
         v = self.mlp(inputs)
         return v

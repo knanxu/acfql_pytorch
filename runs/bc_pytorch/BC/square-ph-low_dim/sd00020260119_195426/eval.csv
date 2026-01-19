@@ -1,0 +1,2 @@
+avg_gripper_contact_length,num_gripper_contacts,return,episode_length,success,total.timesteps,episode.final_reward,episode.return,episode.length,episode.duration,step
+0.0,0.0,0.34,326.38,0.34,7942.08,0.34,0.34,326.38,19.21450481891632,100000
