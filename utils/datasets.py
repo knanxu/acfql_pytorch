@@ -2,6 +2,9 @@ import numpy as np
 import torch
 from typing import Dict, List, Optional, Any, Union
 
+# Import lazy image dataset for memory-efficient image loading
+from utils.lazy_image_dataset import LazyImageDataset
+
 
 class Dataset:
     """
@@ -167,22 +170,33 @@ class Dataset:
         for key in keys:
             if key not in batch:
                 continue
-            
+
             data = batch[key]
-            # Only augment 4D image data (batch, height, width, channels)
-            if data.ndim == 4:
-                batch[key] = np.array([
-                    self._random_crop(img, self.aug_padding) for img in data
-                ])
+
+            if isinstance(data, dict):
+                # Dict observations: augment each image key
+                for obs_key, obs_data in data.items():
+                    # Only augment 4D image data (batch, height, width, channels)
+                    if obs_data.ndim == 4:
+                        batch[key][obs_key] = np.array([
+                            self._random_crop(img, self.aug_padding) for img in obs_data
+                        ])
+            else:
+                # Flat observations: existing behavior
+                # Only augment 4D image data (batch, height, width, channels)
+                if data.ndim == 4:
+                    batch[key] = np.array([
+                        self._random_crop(img, self.aug_padding) for img in data
+                    ])
     
     def sample(self, batch_size: int, indices: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
         """
         Sample a random batch of transitions.
-        
+
         Args:
             batch_size: Number of transitions to sample
             indices: Optional specific indices to sample (for reproducibility)
-        
+
         Returns:
             Dictionary with sampled transitions.
             If pytorch_format=True, images are in (B, C, H, W) format.
@@ -190,56 +204,89 @@ class Dataset:
         """
         if indices is None:
             indices = np.random.randint(0, self.size, size=batch_size)
-        
+
         # Basic sampling
         batch = self._apply_to_nested(lambda arr: arr[indices], self._data)
-        
+
         # Add next actions if requested
         if self.return_next_actions:
             next_indices = np.minimum(indices + 1, self.size - 1)
             batch['next_actions'] = self._data['actions'][next_indices]
-        
+
         # Handle frame stacking
         if self.frame_stack is not None:
             batch = self._stack_frames(batch, indices)
-        
-        # Apply augmentation (always done in NumPy format)
-        if self.p_aug is not None and np.random.rand() < self.p_aug:
-            self._augment_batch(batch, ['observations', 'next_observations'])
-        
-        # Convert to PyTorch format if requested
-        if self.pytorch_format:
-            for key in ['observations', 'next_observations']:
-                if key in batch and self._is_image_data(batch[key]):
-                    batch[key] = self._to_pytorch_format(batch[key])
-        
+
+        # Check if observations is a dict (for image-based robomimic environments)
+        is_dict_obs = isinstance(batch.get('observations'), dict)
+
+        if is_dict_obs:
+            # Handle dict observations
+            # Apply augmentation (always done in NumPy format)
+            if self.p_aug is not None and np.random.rand() < self.p_aug:
+                for key in ['observations', 'next_observations']:
+                    if key in batch and isinstance(batch[key], dict):
+                        for obs_key, obs_data in batch[key].items():
+                            if self._is_image_data(obs_data):
+                                batch[key][obs_key] = np.array([
+                                    self._random_crop(img, self.aug_padding) for img in obs_data
+                                ])
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                for key in ['observations', 'next_observations']:
+                    if key in batch and isinstance(batch[key], dict):
+                        for obs_key, obs_data in batch[key].items():
+                            if self._is_image_data(obs_data):
+                                batch[key][obs_key] = self._to_pytorch_format(obs_data)
+        else:
+            # Handle flat observations (original behavior)
+            # Apply augmentation (always done in NumPy format)
+            if self.p_aug is not None and np.random.rand() < self.p_aug:
+                self._augment_batch(batch, ['observations', 'next_observations'])
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                for key in ['observations', 'next_observations']:
+                    if key in batch and self._is_image_data(batch[key]):
+                        batch[key] = self._to_pytorch_format(batch[key])
+
         return batch
     
     def _stack_frames(self, batch: Dict, indices: np.ndarray) -> Dict:
         """Stack historical frames for current observations."""
+        # Check if observations is a dict (for image-based robomimic environments)
+        if isinstance(batch.get('observations'), dict):
+            # Frame stacking for dict observations is not yet implemented
+            # This feature is complex and may not be needed for robomimic image tasks
+            raise NotImplementedError(
+                "Frame stacking is not yet supported for dict observations. "
+                "Please set frame_stack=None when using image-based robomimic environments."
+            )
+
         # Find episode start for each sampled index
         episode_start_indices = self.episode_starts[
             np.searchsorted(self.episode_starts, indices, side='right') - 1
         ]
-        
+
         obs_frames = []
         next_obs_frames = []
-        
+
         # Collect frames from t-k to t
         for k in range(self.frame_stack - 1, -1, -1):
             # Clamp to episode boundaries
             frame_indices = np.maximum(indices - k, episode_start_indices)
-            
+
             obs_frame = self._apply_to_nested(
-                lambda arr: arr[frame_indices], 
+                lambda arr: arr[frame_indices],
                 self._data['observations']
             )
             obs_frames.append(obs_frame)
-            
+
             # For next_obs, shift by one timestep
             if k > 0:
                 next_obs_frames.append(obs_frame)
-        
+
         # Add the actual next observation
         next_obs_frames.append(
             self._apply_to_nested(
@@ -247,7 +294,7 @@ class Dataset:
                 self._data['next_observations']
             )
         )
-        
+
         # Concatenate along the last axis (channel dimension)
         batch['observations'] = self._apply_to_nested(
             lambda *frames: np.concatenate(frames, axis=-1),
@@ -257,25 +304,25 @@ class Dataset:
             lambda *frames: np.concatenate(frames, axis=-1),
             *next_obs_frames
         )
-        
+
         return batch
     
     def sample_sequence(
-        self, 
-        batch_size: int, 
+        self,
+        batch_size: int,
         sequence_length: int,
         discount: float = 0.99
     ) -> Dict[str, np.ndarray]:
         """
         Sample sequences of consecutive transitions.
-        
+
         Useful for Transformer/RNN-based methods that need temporal context.
-        
+
         Args:
             batch_size: Number of sequences to sample
             sequence_length: Length of each sequence
             discount: Discount factor for computing cumulative rewards
-        
+
         Returns:
             Dictionary containing:
                 - observations: Starting observation
@@ -290,101 +337,133 @@ class Dataset:
                 - masks: Validity mask (B, T)
                 - terminals: Terminal flags (B, T)
                 - valid: Within-episode validity (B, T)
-            
+
             where B=batch_size, T=sequence_length
         """
         # Sample valid starting indices
         max_start = self.size - sequence_length
         if max_start <= 0:
             raise ValueError(f"Dataset size {self.size} too small for sequence length {sequence_length}")
-        
+
         start_indices = np.random.randint(0, max_start, size=batch_size)
-        
+
         # Create sequence indices: (batch_size, sequence_length)
         sequence_indices = start_indices[:, None] + np.arange(sequence_length)[None, :]
         flat_indices = sequence_indices.ravel()
-        
-        # Helper to fetch and reshape data
-        def fetch_sequence(key: str) -> np.ndarray:
-            data = self._data[key][flat_indices]
-            new_shape = (batch_size, sequence_length) + data.shape[1:]
-            return data.reshape(new_shape)
-        
-        # Fetch all sequences
-        obs_seq = fetch_sequence('observations')
-        next_obs_seq = fetch_sequence('next_observations')
-        action_seq = fetch_sequence('actions')
-        reward_seq = fetch_sequence('rewards')
-        
+
+        # Check if observations is a dict (for image-based robomimic environments)
+        is_dict_obs = isinstance(self._data.get('observations'), dict)
+
+        if is_dict_obs:
+            # Handle dict observations
+            # Fetch sequences for each observation key
+            obs_seq = {}
+            next_obs_seq = {}
+            for obs_key in self._data['observations'].keys():
+                obs_data = self._data['observations'][obs_key][flat_indices]
+                obs_seq[obs_key] = obs_data.reshape((batch_size, sequence_length) + obs_data.shape[1:])
+
+                next_obs_data = self._data['next_observations'][obs_key][flat_indices]
+                next_obs_seq[obs_key] = next_obs_data.reshape((batch_size, sequence_length) + next_obs_data.shape[1:])
+
+            # Fetch initial observations
+            initial_obs = {}
+            for obs_key in self._data['observations'].keys():
+                initial_obs[obs_key] = self._data['observations'][obs_key][start_indices]
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                for obs_key in obs_seq.keys():
+                    if self._is_image_data(obs_seq[obs_key]):
+                        obs_seq[obs_key] = self._to_pytorch_format(obs_seq[obs_key])
+                        next_obs_seq[obs_key] = self._to_pytorch_format(next_obs_seq[obs_key])
+                        initial_obs[obs_key] = self._to_pytorch_format(initial_obs[obs_key])
+        else:
+            # Handle flat observations (original behavior)
+            # Helper to fetch and reshape data
+            def fetch_sequence(key: str) -> np.ndarray:
+                data = self._data[key][flat_indices]
+                new_shape = (batch_size, sequence_length) + data.shape[1:]
+                return data.reshape(new_shape)
+
+            # Fetch all sequences
+            obs_seq = fetch_sequence('observations')
+            next_obs_seq = fetch_sequence('next_observations')
+
+            # Fetch initial observations
+            initial_obs = self._data['observations'][start_indices]
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                if self._is_image_data(obs_seq):
+                    obs_seq = self._to_pytorch_format(obs_seq)
+                    next_obs_seq = self._to_pytorch_format(next_obs_seq)
+                    initial_obs = self._to_pytorch_format(initial_obs)
+
+        # Fetch action sequences (same for both dict and flat observations)
+        action_data = self._data['actions'][flat_indices]
+        action_seq = action_data.reshape((batch_size, sequence_length) + action_data.shape[1:])
+
+        reward_data = self._data['rewards'][flat_indices]
+        reward_seq = reward_data.reshape((batch_size, sequence_length) + reward_data.shape[1:])
+
         # Handle masks and terminals
         if 'masks' in self._data:
-            mask_seq = fetch_sequence('masks')
+            mask_data = self._data['masks'][flat_indices]
+            mask_seq = mask_data.reshape((batch_size, sequence_length) + mask_data.shape[1:])
         else:
             mask_seq = np.ones_like(reward_seq)
-        
+
         terminal_key = 'terminals' if 'terminals' in self._data else 'dones'
         if terminal_key in self._data:
-            terminal_seq = fetch_sequence(terminal_key)
+            terminal_data = self._data[terminal_key][flat_indices]
+            terminal_seq = terminal_data.reshape((batch_size, sequence_length) + terminal_data.shape[1:])
         else:
             terminal_seq = np.zeros_like(reward_seq)
-        
+
         # Compute next actions (look one step ahead)
         next_action_indices = np.minimum(sequence_indices + 1, self.size - 1).ravel()
         next_actions = self._data['actions'][next_action_indices].reshape(
             batch_size, sequence_length, -1
         )
-        
+
         # Compute cumulative rewards and propagate episode information
         cumulative_rewards = np.zeros((batch_size, sequence_length))
         cumulative_masks = np.ones((batch_size, sequence_length))
         cumulative_terminals = np.zeros((batch_size, sequence_length))
         validity = np.ones((batch_size, sequence_length))
-        
+
         # Initialize first timestep
         cumulative_rewards[:, 0] = reward_seq[:, 0].squeeze()
         cumulative_masks[:, 0] = mask_seq[:, 0].squeeze()
         cumulative_terminals[:, 0] = terminal_seq[:, 0].squeeze()
-        
+
         # Discount powers for efficient computation
         discount_power = discount ** np.arange(sequence_length)
-        
+
         # Propagate through sequence
         for t in range(1, sequence_length):
             # Accumulate discounted rewards
             cumulative_rewards[:, t] = (
-                cumulative_rewards[:, t-1] + 
+                cumulative_rewards[:, t-1] +
                 reward_seq[:, t].squeeze() * discount_power[t]
             )
-            
+
             # Masks: take minimum (all must be valid)
             cumulative_masks[:, t] = np.minimum(
                 cumulative_masks[:, t-1],
                 mask_seq[:, t].squeeze()
             )
-            
+
             # Terminals: take maximum (any terminal propagates)
             cumulative_terminals[:, t] = np.maximum(
                 cumulative_terminals[:, t-1],
                 terminal_seq[:, t].squeeze()
             )
-            
+
             # Validity: 0 if previous timestep was terminal
             validity[:, t] = 1.0 - cumulative_terminals[:, t-1]
-        
-        # Convert to PyTorch format if requested
-        # Visual observations: (B, T, H, W, C) -> (B, T, C, H, W)
-        if self.pytorch_format:
-            if self._is_image_data(obs_seq):
-                obs_seq = self._to_pytorch_format(obs_seq)
-                next_obs_seq = self._to_pytorch_format(next_obs_seq)
-            
-            # Also convert initial observations
-            initial_obs = self._data['observations'][start_indices]
-            if self._is_image_data(initial_obs):
-                initial_obs = self._to_pytorch_format(initial_obs)
-        else:
-            initial_obs = self._data['observations'][start_indices]
-        
+
         return {
             'observations': initial_obs,  # Initial obs
             'full_observations': obs_seq,

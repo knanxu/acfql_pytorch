@@ -138,7 +138,14 @@ def main(_):
     set_seed(FLAGS.seed)
     
     # Create environment and datasets
-    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
+    result = make_env_and_datasets(FLAGS.env_name)
+    if len(result) == 5:
+        # Image-based environment returns shape_meta
+        env, eval_env, train_dataset, val_dataset, shape_meta = result
+    else:
+        # Non-image environment
+        env, eval_env, train_dataset, val_dataset = result
+        shape_meta = None
     
     # Process dataset
     train_dataset = process_train_dataset(
@@ -151,10 +158,20 @@ def main(_):
     
     # Get example batch for agent creation
     example_batch = train_dataset.sample(1)
-    observation_shape = example_batch['observations'].shape[1:]  # Remove batch dim
+
+    # Handle dict observations (image environments) vs tensor observations
+    if isinstance(example_batch['observations'], dict):
+        # Image environment with dict observations - use shape_meta
+        observation_shape = shape_meta
+        print(f"Observation type: dict (image-based)")
+        for key, meta in shape_meta['obs'].items():
+            print(f"  {key}: {meta['shape']} ({meta['type']})")
+    else:
+        # Regular tensor observations
+        observation_shape = example_batch['observations'].shape[1:]  # Remove batch dim
+        print(f"Observation shape: {observation_shape}")
+
     action_dim = example_batch['actions'].shape[-1]
-    
-    print(f"Observation shape: {observation_shape}")
     print(f"Action dim: {action_dim}")
     
     # Get agent class
@@ -163,8 +180,12 @@ def main(_):
     print(f"Using agent: {agent_name} ({AgentClass.__name__})")
     
     # Convert ml_collections.ConfigDict to dict for agent
-    # ml_collections.ConfigDict can be converted to dict directly
-    agent_config = dict(config)
+    # ml_collections.ConfigDict can be converted to dict directly or use to_dict()
+    import ml_collections
+    if isinstance(config, ml_collections.ConfigDict):
+        agent_config = config.to_dict()
+    else:
+        agent_config = dict(config)
     
     # Create agent (agents use dict-based config, not dataclass)
     agent = AgentClass.create(
@@ -196,9 +217,17 @@ def main(_):
             sequence_length=config['horizon_length'],
             discount=config['discount']
         )
-        
-        # Convert to torch tensors
-        batch = {k: torch.from_numpy(v).float() for k, v in batch.items()}
+
+        # Convert to torch tensors (handle nested dicts for image observations)
+        def to_torch(x):
+            if isinstance(x, dict):
+                return {k: to_torch(v) for k, v in x.items()}
+            elif isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float()
+            else:
+                return x
+
+        batch = {k: to_torch(v) for k, v in batch.items()}
         
         # Update agent
         info = agent.update(batch)

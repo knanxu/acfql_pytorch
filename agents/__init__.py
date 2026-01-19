@@ -9,7 +9,6 @@ Available agents:
 
 All agents use dict-based config (similar to JAX version).
 """
-
 from agents.fbc import BCAgent, get_config as fbc_get_config
 from agents.mfbc import MFBCAgent, get_config as mfbc_get_config
 from agents.imfbc import IMFBCAgent, get_config as imfbc_get_config

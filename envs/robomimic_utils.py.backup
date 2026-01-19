@@ -17,19 +17,11 @@ from utils.datasets import Dataset
 
 
 def is_robomimic_env(env_name):
-    """Determine if an env is robomimic (both low_dim and image)."""
-    # Check if it's a robomimic task
-    task_name = env_name.split("-")[0]
-    if task_name not in ("lift", "can", "square", "transport", "tool_hang"):
+    """determine if an env is robomimic"""
+    if "low_dim" not in env_name:
         return False
-
-    # Check if it has valid dataset type
-    parts = env_name.split("-")
-    if len(parts) < 2:
-        return False
-
-    dataset_type = parts[1]
-    return dataset_type in ("mh", "ph", "mg")
+    task, dataset_type, hdf5_type = env_name.split("-")
+    return task in ("lift", "can", "square", "transport", "tool_hang") and dataset_type in ("mh", "ph")
 
 
 low_dim_keys = {"low_dim": ('robot0_eef_pos',

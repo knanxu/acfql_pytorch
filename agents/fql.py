@@ -7,33 +7,42 @@ Implements FQL algorithm with:
 - Critic network for Q-learning
 - Distillation policy for one-step action generation
 
+Supports:
+- Encoder types: 'identity', 'mlp', 'image' (ResNet-based), 'impala'
+- Policy types: 'mlp' (ActorVectorField)
+- Multi-modal observations (multiple cameras + proprioceptive data)
+- Action chunking with flexible horizon lengths
+
 Config is passed as a dictionary (similar to JAX version).
 """
 
 import copy
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-from utils.model import ActorVectorField, Value, ImpalaEncoder
+from utils.network_factory import get_encoder
+from utils.networks import ActorVectorField, Value
 
 
 class FQLAgent:
     """
     Flow Q-Learning Agent.
-    
+
     Features:
     - Flow-based action modeling (continuous normalizing flow)
     - Action chunking support (predict multiple future actions)
+    - Visual encoders: ResNet-based, IMPALA, MLP, Identity
+    - Multi-modal observations (multiple cameras + proprioceptive data)
     - Critic network for Q-learning
     - Distillation policy for one-step action generation
-    
+
     Config is passed as a dictionary (similar to JAX version).
     """
-    
+
     def __init__(
         self,
         actor: nn.Module,
@@ -43,6 +52,8 @@ class FQLAgent:
         actor_optimizer: optim.Optimizer,
         critic_optimizer: optim.Optimizer,
         config: Dict[str, Any],
+        encoder: Optional[nn.Module] = None,
+        critic_encoder: Optional[nn.Module] = None,
     ):
         """Initialize FQL Agent."""
         self.actor = actor  # Flow network (like BCAgent)
@@ -52,17 +63,29 @@ class FQLAgent:
         self.actor_optimizer = actor_optimizer
         self.critic_optimizer = critic_optimizer
         self.config = config
-        
+        self.encoder = encoder
+        self.critic_encoder = critic_encoder
+
         self.device = torch.device(config['device'])
-        
+
         # Move models to device
         self.actor.to(self.device)
         self.actor_onestep.to(self.device)
         self.critic.to(self.device)
         self.target_critic.to(self.device)
-        
+        if self.encoder is not None:
+            self.encoder.to(self.device)
+        if self.critic_encoder is not None:
+            self.critic_encoder.to(self.device)
+
         # Training step counter
         self.step = 0
+
+    def _encode_observations(self, observations: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
+        """Encode observations using the encoder if present."""
+        if self.encoder is not None:
+            return self.encoder(observations)
+        return observations
     
     def actor_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
@@ -85,8 +108,16 @@ class FQLAgent:
         """
         observations = batch['observations']
         actions = batch['actions']
-        
-        batch_size = observations.shape[0]
+
+        # Get batch size
+        if isinstance(observations, dict):
+            first_key = list(observations.keys())[0]
+            batch_size = observations[first_key].shape[0]
+        else:
+            batch_size = observations.shape[0]
+
+        # Encode observations if using separate encoder
+        obs_emb = self._encode_observations(observations)
         
         # Handle action chunking
         if self.config['action_chunking']:
@@ -110,8 +141,11 @@ class FQLAgent:
         
         x_t = (1 - t) * x_0 + t * x_1
         target_vel = x_1 - x_0  # target velocity
-        
-        pred_vel = self.actor(observations, x_t, t)
+
+        if self.encoder is not None:
+            pred_vel = self.actor(obs_emb, x_t, t, is_encoded=True)
+        else:
+            pred_vel = self.actor(observations, x_t, t)
         
         if self.config['action_chunking'] and 'valid' in batch:
             valid = batch['valid']
@@ -129,18 +163,27 @@ class FQLAgent:
         # === Distillation Loss ===
         # Train one-step actor to match flow actions
         noises = torch.randn(batch_size, action_dim, device=self.device)
-        
+
         with torch.no_grad():
             target_flow_actions = self.compute_flow_actions(observations, noises)
-        
+
         # One-step actor (no time input - matches JAX version)
-        actor_actions = self.actor_onestep(observations, noises)
+        if self.encoder is not None:
+            actor_actions = self.actor_onestep(obs_emb, noises, is_encoded=True)
+        else:
+            actor_actions = self.actor_onestep(observations, noises)
         distill_loss = ((actor_actions - target_flow_actions) ** 2).mean()
-        
+
         # === Q Loss ===
         # Maximize Q value for one-step actions
         actor_actions_clipped = torch.clamp(actor_actions, -1, 1)
-        qs = self.critic(observations, actor_actions_clipped)
+
+        # Encode observations for critic if needed
+        if self.critic_encoder is not None:
+            obs_emb_critic = self.critic_encoder(observations)
+            qs = self.critic(obs_emb_critic, actor_actions_clipped)
+        else:
+            qs = self.critic(observations, actor_actions_clipped)
         q = qs.mean(dim=0)  # Mean over ensemble
         q_loss = -q.mean()
         
@@ -177,8 +220,21 @@ class FQLAgent:
         next_observations = batch.get('next_observations', observations)
         rewards = batch['rewards']
         masks = batch.get('masks', 1.0 - batch.get('terminals', torch.zeros_like(rewards)))
-        
-        batch_size = observations.shape[0]
+
+        # Get batch size
+        if isinstance(observations, dict):
+            first_key = list(observations.keys())[0]
+            batch_size = observations[first_key].shape[0]
+        else:
+            batch_size = observations.shape[0]
+
+        # Encode observations for critic if needed
+        if self.critic_encoder is not None:
+            obs_emb = self.critic_encoder(observations)
+            next_obs_emb = self.critic_encoder(next_observations)
+        else:
+            obs_emb = observations
+            next_obs_emb = next_observations
         
         # Handle action chunking
         if self.config['action_chunking']:
@@ -213,11 +269,20 @@ class FQLAgent:
         with torch.no_grad():
             # Sample next actions using one-step policy (no time input - matches JAX)
             noises = torch.randn(batch_size, action_dim, device=self.device)
-            next_actions = self.actor_onestep(next_obs, noises)
+
+            # Encode next observations for actor if needed
+            if self.encoder is not None:
+                next_obs_emb_actor = self._encode_observations(next_obs)
+                next_actions = self.actor_onestep(next_obs_emb_actor, noises, is_encoded=True)
+            else:
+                next_actions = self.actor_onestep(next_obs, noises)
             next_actions = torch.clamp(next_actions, -1, 1)
-            
+
             # Compute target Q values
-            next_qs = self.target_critic(next_obs, next_actions)  # (num_ensembles, B)
+            if self.critic_encoder is not None:
+                next_qs = self.target_critic(next_obs_emb, next_actions)  # (num_ensembles, B)
+            else:
+                next_qs = self.target_critic(next_obs, next_actions)  # (num_ensembles, B)
             
             if self.config['q_agg'] == 'min':
                 next_q = next_qs.min(dim=0)[0]
@@ -229,7 +294,10 @@ class FQLAgent:
             target_q = last_reward + discount_factor * last_mask * next_q
         
         # Compute current Q values
-        current_qs = self.critic(observations, batch_actions)  # (num_ensembles, B)
+        if self.critic_encoder is not None:
+            current_qs = self.critic(obs_emb, batch_actions)  # (num_ensembles, B)
+        else:
+            current_qs = self.critic(observations, batch_actions)  # (num_ensembles, B)
         
         # Get valid mask (critical for action chunking - masks out cross-episode samples)
         if 'valid' in batch:
@@ -356,70 +424,96 @@ class FQLAgent:
     @torch.no_grad()
     def compute_flow_actions(
         self,
-        observations: torch.Tensor,
+        observations: Union[torch.Tensor, Dict[str, torch.Tensor]],
         noises: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute actions from the flow model using Euler method."""
+    ):
+        """Compute actions from the BC flow model using the Euler method."""
+        # Encode observations if needed
+        obs_emb = self._encode_observations(observations)
+
+        # Get batch size
+        if isinstance(obs_emb, dict):
+            first_key = list(obs_emb.keys())[0]
+            batch_size = obs_emb[first_key].shape[0]
+        else:
+            batch_size = obs_emb.shape[0]
+
+        flow_steps = self.config.get('flow_steps', 10)
+
         actions = noises
-        
-        # Euler method integration
-        for i in range(self.config['flow_steps']):
-            t = torch.full(
-                (observations.shape[0], 1), 
-                i / self.config['flow_steps'], 
-                device=self.device
-            )
-            vels = self.actor(observations, actions, t)
-            actions = actions + vels / self.config['flow_steps']
-        
+        for i in range(flow_steps):
+            t = torch.full((batch_size, 1), i / flow_steps, device=self.device)
+            if self.encoder is not None:
+                vels = self.actor(obs_emb, actions, t, is_encoded=True)
+            else:
+                vels = self.actor(observations, actions, t)
+            actions = actions + vels / flow_steps
         actions = torch.clamp(actions, -1, 1)
+
         return actions
-    
+
     @torch.no_grad()
     def sample_actions(
         self,
-        observations: torch.Tensor,
+        observations: Union[torch.Tensor, Dict[str, torch.Tensor], np.ndarray],
         temperature: float = 1.0,
     ) -> np.ndarray:
-        """
-        Sample actions using the trained policy.
-        
+        """Sample actions using the trained policy.
+
         Uses the one-step distillation policy for fast inference.
-        
+
         Args:
-            observations: (B, obs_dim) or single observation
+            observations: Observations
             temperature: Sampling temperature (for noise scaling)
-        
+
         Returns:
-            actions: (B, action_dim) numpy array
+            actions: numpy array
         """
-        if not isinstance(observations, torch.Tensor):
-            observations = torch.from_numpy(observations).float()
-        observations = observations.to(self.device)
-        
+        # Helper to convert to torch
+        def to_torch(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float().to(self.device)
+            elif isinstance(x, dict):
+                return {k: to_torch(v) for k, v in x.items()}
+            elif isinstance(x, torch.Tensor):
+                return x.to(self.device)
+            return x
+
+        observations = to_torch(observations)
+
         # Ensure batch dimension exists
-        if observations.ndim == 1:
-            observations = observations.unsqueeze(0)
-        
-        batch_size = observations.shape[0]
+        if isinstance(observations, dict):
+            first_key = list(observations.keys())[0]
+            if observations[first_key].ndim in [1, 3]:  # (dim,) or (C, H, W)
+                observations = {k: v.unsqueeze(0) for k, v in observations.items()}
+            batch_size = observations[first_key].shape[0]
+        else:
+            if observations.ndim == 1:
+                observations = observations.unsqueeze(0)
+            batch_size = observations.shape[0]
+
         action_dim = self.config['action_dim']
         if self.config['action_chunking']:
             action_dim *= self.config['horizon_length']
-        
+
         # Sample noise
         noises = torch.randn(batch_size, action_dim, device=self.device)
         if temperature != 1.0:
             noises = noises * temperature
-        
-        # Use one-step policy for fast inference (no time input - matches JAX)
-        actions = self.actor_onestep(observations, noises)
+
+        # Use one-step policy for fast inference
+        obs_emb = self._encode_observations(observations)
+        if self.encoder is not None:
+            actions = self.actor_onestep(obs_emb, noises, is_encoded=True)
+        else:
+            actions = self.actor_onestep(observations, noises)
         actions = torch.clamp(actions, -1, 1)
-        
+
         return actions.cpu().numpy()
-    
+
     def save(self, path: str):
         """Save agent checkpoint."""
-        torch.save({
+        save_dict = {
             'actor': self.actor.state_dict(),
             'actor_onestep': self.actor_onestep.state_dict(),
             'critic': self.critic.state_dict(),
@@ -428,9 +522,15 @@ class FQLAgent:
             'critic_optimizer': self.critic_optimizer.state_dict(),
             'config': self.config,
             'step': self.step,
-        }, path)
+        }
+        if self.encoder is not None:
+            save_dict['encoder'] = self.encoder.state_dict()
+        if self.critic_encoder is not None:
+            save_dict['critic_encoder'] = self.critic_encoder.state_dict()
+
+        torch.save(save_dict, path)
         print(f"Agent saved to {path}")
-    
+
     def load(self, path: str):
         """Load agent checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
@@ -440,149 +540,117 @@ class FQLAgent:
         self.target_critic.load_state_dict(checkpoint['target_critic'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        if self.encoder is not None and 'encoder' in checkpoint:
+            self.encoder.load_state_dict(checkpoint['encoder'])
+        if self.critic_encoder is not None and 'critic_encoder' in checkpoint:
+            self.critic_encoder.load_state_dict(checkpoint['critic_encoder'])
         self.step = checkpoint.get('step', 0)
         print(f"Agent loaded from {path} (step {self.step})")
     
     @classmethod
     def create(
         cls,
-        observation_shape: Tuple[int, ...],
+        observation_shape: Union[Tuple[int, ...], Dict],
         action_dim: int,
         config: Dict[str, Any],
     ) -> 'FQLAgent':
-        """
-        Create a new FQL agent.
-        
-        Args:
-            observation_shape: Shape of observations
-            action_dim: Dimension of action space
-            config: Agent configuration dictionary
-        
-        Returns:
-            agent: Initialized FQL agent
-        """
-        # Set dimensions in config
+        """Create a new FQL agent."""
+        config = dict(config)  # Copy to avoid mutation
         config['action_dim'] = action_dim
-        
-        # Determine if visual observations
-        is_visual = len(observation_shape) == 3
-        
-        if is_visual:
-            config['observation_dim'] = observation_shape
-        else:
-            config['observation_dim'] = observation_shape[0]
-        
+        config['act_dim'] = action_dim  # For factory functions
+
         # Set device if not specified
         if 'device' not in config:
             config['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
+
         device = torch.device(config['device'])
-        
-        # Create encoder if visual
-        encoder = None
-        if is_visual and config.get('encoder') is not None:
-            if config['encoder'] == 'impala_small':
-                encoder = ImpalaEncoder(
-                    input_shape=observation_shape,
-                    width=1,
-                    stack_sizes=(16, 32, 32),
-                    num_blocks=2,
-                    mlp_hidden_dims=(512,),
-                    layer_norm=config.get('layer_norm', True),
-                )
-            else:
-                raise ValueError(f"Unknown encoder: {config['encoder']}")
-        
-        # Determine input dimension for networks
-        if encoder is not None:
-            network_input_dim = encoder.output_dim
+
+        # Determine observation type
+        is_multi_image = isinstance(observation_shape, dict)
+        is_visual = is_multi_image or (isinstance(observation_shape, tuple) and len(observation_shape) == 3)
+
+        if is_multi_image:
+            config['shape_meta'] = observation_shape
+            config['obs_type'] = 'image'
+        elif is_visual:
+            config['obs_dim'] = int(np.prod(observation_shape))
+            config['obs_type'] = 'image'
         else:
-            network_input_dim = config['observation_dim'] if not is_visual else np.prod(observation_shape)
-        
-        # Full action dimension (with chunking)
+            config['obs_dim'] = observation_shape[0]
+            config['obs_type'] = 'state'
+
+        # Get configuration parameters
+        horizon_length = config.get('horizon_length', 5)
+        config['Ta'] = horizon_length  # Action sequence length
+        config['To'] = config.get('obs_steps', 1)  # Observation sequence length
+
+        # Create encoder using factory
+        encoder = get_encoder(config)
+        network_input_dim = encoder.output_dim if hasattr(encoder, 'output_dim') else config.get('emb_dim', 256)
+
+        # Full action dimension
         full_action_dim = action_dim
         if config.get('action_chunking', True):
-            full_action_dim = action_dim * config.get('horizon_length', 5)
-        
+            full_action_dim = action_dim * horizon_length
+
         # Create actor (flow network)
         actor = ActorVectorField(
-            observation_dim=network_input_dim,
+            obs_dim=network_input_dim,
             action_dim=full_action_dim,
-            hidden_dim=config.get('actor_hidden_dims', (512, 512, 512, 512)),
-            encoder=encoder,
+            hidden_dims=config.get('actor_hidden_dims', (512, 512, 512, 512)),
+            encoder=None,  # Encoder is separate
             use_fourier_features=config.get('use_fourier_features', False),
             fourier_feature_dim=config.get('fourier_feature_dim', 64),
         )
-        
+
         # Create one-step actor (for distillation)
         # NOTE: One-step actor does NOT use time input (matches JAX version)
-        onestep_encoder = None
-        if is_visual and config.get('encoder') is not None:
-            if config['encoder'] == 'impala_small':
-                onestep_encoder = ImpalaEncoder(
-                    input_shape=observation_shape,
-                    width=1,
-                    stack_sizes=(16, 32, 32),
-                    num_blocks=2,
-                    mlp_hidden_dims=(512,),
-                    layer_norm=config.get('layer_norm', True),
-                )
-        
         actor_onestep = ActorVectorField(
-            observation_dim=network_input_dim,
+            obs_dim=network_input_dim,
             action_dim=full_action_dim,
-            hidden_dim=config.get('actor_hidden_dims', (512, 512, 512, 512)),
-            encoder=onestep_encoder,
+            hidden_dims=config.get('actor_hidden_dims', (512, 512, 512, 512)),
+            encoder=None,  # Encoder is separate
             use_fourier_features=False,
             use_time=False,  # Critical: one-step actor doesn't use time (matches JAX)
         )
-        
+
+        # Create critic encoder (separate from actor encoder)
+        critic_encoder = get_encoder(config)
+
         # Create critic
-        critic_encoder = None
-        if is_visual and config.get('encoder') is not None:
-            if config['encoder'] == 'impala_small':
-                critic_encoder = ImpalaEncoder(
-                    input_shape=observation_shape,
-                    width=1,
-                    stack_sizes=(16, 32, 32),
-                    num_blocks=2,
-                    mlp_hidden_dims=(512,),
-                    layer_norm=config.get('layer_norm', True),
-                )
-        
         critic = Value(
             observation_dim=network_input_dim,
             action_dim=full_action_dim,
             hidden_dim=config.get('value_hidden_dims', (512, 512, 512, 512)),
             num_ensembles=config.get('num_qs', 2),
-            encoder=critic_encoder,
-            layer_norm=config.get('layer_norm', True),  # JAX default is True
+            encoder=None,  # Encoder is separate
+            layer_norm=config.get('layer_norm', True),
         )
-        
+
         # Create target critic
         target_critic = copy.deepcopy(critic)
-        
+
         # Create optimizers
-        actor_params = list(actor.parameters()) + list(actor_onestep.parameters())
-        
         lr = config.get('lr', 3e-4)
         weight_decay = config.get('weight_decay', 0.0)
-        
+
+        # Collect parameters for actor optimizer (includes both actors and encoder)
+        actor_params = list(actor.parameters()) + list(actor_onestep.parameters())
+        if encoder is not None:
+            actor_params += list(encoder.parameters())
+
+        # Collect parameters for critic optimizer
+        critic_params = list(critic.parameters())
+        if critic_encoder is not None:
+            critic_params += list(critic_encoder.parameters())
+
         if weight_decay > 0:
-            actor_optimizer = optim.AdamW(
-                actor_params,
-                lr=lr,
-                weight_decay=weight_decay
-            )
-            critic_optimizer = optim.AdamW(
-                critic.parameters(),
-                lr=lr,
-                weight_decay=weight_decay
-            )
+            actor_optimizer = optim.AdamW(actor_params, lr=lr, weight_decay=weight_decay)
+            critic_optimizer = optim.AdamW(critic_params, lr=lr, weight_decay=weight_decay)
         else:
             actor_optimizer = optim.Adam(actor_params, lr=lr)
-            critic_optimizer = optim.Adam(critic.parameters(), lr=lr)
-        
+            critic_optimizer = optim.Adam(critic_params, lr=lr)
+
         return cls(
             actor=actor,
             actor_onestep=actor_onestep,
@@ -591,6 +659,8 @@ class FQLAgent:
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
             config=config,
+            encoder=encoder,
+            critic_encoder=critic_encoder,
         )
 
 
@@ -599,26 +669,51 @@ def get_config():
     import ml_collections
     return ml_collections.ConfigDict(
         dict(
-            agent_name='fql',  # Agent name
-            lr=3e-4,  # Learning rate
-            batch_size=256,  # Batch size
-            actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions
-            value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions
-            layer_norm=True,  # Whether to use layer normalization (JAX default is True)
-            actor_layer_norm=False,  # Whether to use layer normalization for the actor
-            discount=0.99,  # Discount factor
-            tau=0.005,  # Target network update rate
-            num_qs=2,  # Critic ensemble size
-            flow_steps=10,  # Number of flow steps
-            encoder=None,  # Visual encoder name (None, 'impala_small', etc.)
-            horizon_length=5,  # Action chunking length
-            action_chunking=True,  # Enable action chunking
-            use_fourier_features=False,  # Use Fourier features for time encoding
-            fourier_feature_dim=64,  # Fourier feature dimension
-            weight_decay=0.0,  # Weight decay for optimizer
+            agent_name='fql',
+            lr=3e-4,
+            batch_size=256,
+
+            # Encoder configuration
+            encoder='mlp',  # Encoder type: 'identity', 'mlp', 'image', 'impala'
+            obs_type='state',  # Observation type: 'state', 'image', 'keypoint'
+            emb_dim=256,  # Encoder output dimension
+            encoder_hidden_dims=[256, 256],  # For MLP encoder
+            encoder_dropout=0.25,  # Encoder dropout
+
+            # Image encoder specific
+            rgb_model_name='resnet18',  # ResNet model: 'resnet18', 'resnet34', 'resnet50'
+            resize_shape=None,  # Optional image resize (H, W)
+            crop_shape=None,  # Optional crop for augmentation (H, W)
+            random_crop=True,  # Enable random crop augmentation
+            share_rgb_model=False,  # Share encoder across multiple cameras
+            use_group_norm=True,  # Use GroupNorm in ResNet
+            imagenet_norm=False,  # Use ImageNet normalization
+
+            # Network configuration
+            actor_hidden_dims=(512, 512, 512, 512),
+            value_hidden_dims=(512, 512, 512, 512),
+            layer_norm=True,
+            actor_layer_norm=False,
+
+            # Training
+            discount=0.99,
+            tau=0.005,
+            num_qs=2,
+            flow_steps=10,
+            weight_decay=0.0,
+
+            # Action chunking
+            horizon_length=5,
+            action_chunking=True,
+            obs_steps=1,  # Observation context length
+
+            # Time embedding
+            use_fourier_features=False,
+            fourier_feature_dim=64,
+
             # FQL specific
-            bc_weight=1.0,  # BC loss weight
-            alpha=100.0,  # Distillation coefficient
+            bc_weight=1.0,
+            alpha=100.0,
             q_agg='mean',  # Q aggregation method (min or mean)
         )
     )

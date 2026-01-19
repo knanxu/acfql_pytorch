@@ -31,15 +31,15 @@ class ReplayBuffer(Dataset):
     def create(cls, transition: Dict[str, Any], size: int) -> 'ReplayBuffer':
         """
         Create a replay buffer from an example transition.
-        
+
         Args:
-            transition: Example transition dict with keys like 
+            transition: Example transition dict with keys like
                         'observations', 'actions', 'rewards', etc.
             size: Maximum size of the replay buffer.
-        
+
         Returns:
             Empty replay buffer with pre-allocated arrays.
-        
+
         Example:
             transition = {
                 'observations': np.zeros(obs_dim),
@@ -52,11 +52,15 @@ class ReplayBuffer(Dataset):
             buffer = ReplayBuffer.create(transition, size=1000000)
         """
         def create_buffer(example):
-            example = np.asarray(example)
-            return np.zeros((size, *example.shape), dtype=example.dtype)
-        
+            if isinstance(example, dict):
+                # Recursively create buffers for dict
+                return {k: create_buffer(v) for k, v in example.items()}
+            else:
+                example = np.asarray(example)
+                return np.zeros((size, *example.shape), dtype=example.dtype)
+
         buffer_dict = {k: create_buffer(v) for k, v in transition.items()}
-        
+
         buffer = cls(buffer_dict)
         buffer.max_size = size
         buffer.size = 0
@@ -65,33 +69,33 @@ class ReplayBuffer(Dataset):
     
     @classmethod
     def create_from_initial_dataset(
-        cls, 
-        init_dataset: Dataset, 
+        cls,
+        init_dataset: Dataset,
         size: int,
         copy_data: bool = True
     ) -> 'ReplayBuffer':
         """
         Create a replay buffer initialized with an offline dataset.
-        
+
         This is the main method for offline-to-online RL, where we start
         with an offline dataset and add online transitions.
-        
+
         Args:
             init_dataset: Initial offline dataset (Dataset object or dict).
             size: Maximum size of the replay buffer.
-            copy_data: If True, copy data from init_dataset. 
+            copy_data: If True, copy data from init_dataset.
                       If False, reference the same arrays (faster but modifies original).
-        
+
         Returns:
             Replay buffer initialized with the offline data.
-        
+
         Example:
             # Load offline dataset
             train_dataset = Dataset.create(**offline_data)
-            
+
             # Create buffer for online training (1M capacity)
             buffer = ReplayBuffer.create_from_initial_dataset(
-                train_dataset, 
+                train_dataset,
                 size=1000000
             )
         """
@@ -102,25 +106,29 @@ class ReplayBuffer(Dataset):
         else:
             init_data = init_dataset
             init_size = get_size(init_data)
-        
+
         def create_buffer(init_buffer):
-            init_buffer = np.asarray(init_buffer)
-            buffer = np.zeros((size, *init_buffer.shape[1:]), dtype=init_buffer.dtype)
-            # Copy initial data
-            copy_len = min(len(init_buffer), size)
-            if copy_data:
-                buffer[:copy_len] = init_buffer[:copy_len].copy()
+            if isinstance(init_buffer, dict):
+                # Recursively handle dict
+                return {k: create_buffer(v) for k, v in init_buffer.items()}
             else:
-                buffer[:copy_len] = init_buffer[:copy_len]
-            return buffer
-        
+                init_buffer = np.asarray(init_buffer)
+                buffer = np.zeros((size, *init_buffer.shape[1:]), dtype=init_buffer.dtype)
+                # Copy initial data
+                copy_len = min(len(init_buffer), size)
+                if copy_data:
+                    buffer[:copy_len] = init_buffer[:copy_len].copy()
+                else:
+                    buffer[:copy_len] = init_buffer[:copy_len]
+                return buffer
+
         buffer_dict = {k: create_buffer(v) for k, v in init_data.items()}
-        
+
         buffer = cls(buffer_dict)
         buffer.max_size = size
         buffer.size = min(init_size, size)
         buffer.pointer = buffer.size % size
-        
+
         # Copy dataset settings
         if isinstance(init_dataset, Dataset):
             buffer.frame_stack = init_dataset.frame_stack
@@ -128,7 +136,7 @@ class ReplayBuffer(Dataset):
             buffer.aug_padding = init_dataset.aug_padding
             buffer.return_next_actions = init_dataset.return_next_actions
             buffer.pytorch_format = init_dataset.pytorch_format
-        
+
         return buffer
     
     def __init__(self, data: Dict[str, np.ndarray]):
@@ -147,10 +155,10 @@ class ReplayBuffer(Dataset):
     def add_transition(self, transition: Dict[str, Any]):
         """
         Add a single transition to the replay buffer.
-        
+
         Args:
             transition: Dict with same keys as buffer.
-        
+
         Example:
             buffer.add_transition({
                 'observations': obs,
@@ -161,10 +169,18 @@ class ReplayBuffer(Dataset):
                 'masks': 1.0 - done,
             })
         """
+        def add_value(buffer, value, pointer):
+            if isinstance(value, dict):
+                # Recursively handle dict values
+                for k, v in value.items():
+                    add_value(buffer[k], v, pointer)
+            else:
+                buffer[pointer] = np.asarray(value)
+
         for key, value in transition.items():
             if key in self._data:
-                self._data[key][self.pointer] = np.asarray(value)
-        
+                add_value(self._data[key], value, self.pointer)
+
         self.pointer = (self.pointer + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
     
@@ -199,36 +215,60 @@ class ReplayBuffer(Dataset):
     def sample(self, batch_size: int, indices: np.ndarray = None) -> Dict[str, np.ndarray]:
         """
         Sample a batch of transitions.
-        
+
         Overrides parent to use current size instead of total array size.
-        
+
         Args:
             batch_size: Number of transitions to sample.
             indices: Optional specific indices to sample.
-        
+
         Returns:
             Dictionary with sampled transitions.
         """
         if indices is None:
             indices = np.random.randint(0, self.size, size=batch_size)
-        
+
         # Use parent's sampling logic
         batch = self._apply_to_nested(lambda arr: arr[indices], self._data)
-        
+
         # Handle frame stacking
         if self.frame_stack is not None:
             batch = self._stack_frames(batch, indices)
-        
-        # Apply augmentation
-        if self.p_aug is not None and np.random.rand() < self.p_aug:
-            self._augment_batch(batch, ['observations', 'next_observations'])
-        
-        # Convert to PyTorch format if requested
-        if self.pytorch_format:
-            for key in ['observations', 'next_observations']:
-                if key in batch and self._is_image_data(batch[key]):
-                    batch[key] = self._to_pytorch_format(batch[key])
-        
+
+        # Check if observations is a dict (for image-based robomimic environments)
+        is_dict_obs = isinstance(batch.get('observations'), dict)
+
+        if is_dict_obs:
+            # Handle dict observations
+            # Apply augmentation (always done in NumPy format)
+            if self.p_aug is not None and np.random.rand() < self.p_aug:
+                for key in ['observations', 'next_observations']:
+                    if key in batch and isinstance(batch[key], dict):
+                        for obs_key, obs_data in batch[key].items():
+                            if self._is_image_data(obs_data):
+                                batch[key][obs_key] = np.array([
+                                    self._random_crop(img, self.aug_padding) for img in obs_data
+                                ])
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                for key in ['observations', 'next_observations']:
+                    if key in batch and isinstance(batch[key], dict):
+                        for obs_key, obs_data in batch[key].items():
+                            if self._is_image_data(obs_data):
+                                batch[key][obs_key] = self._to_pytorch_format(obs_data)
+        else:
+            # Handle flat observations (original behavior)
+            # Apply augmentation
+            if self.p_aug is not None and np.random.rand() < self.p_aug:
+                self._augment_batch(batch, ['observations', 'next_observations'])
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                for key in ['observations', 'next_observations']:
+                    if key in batch and self._is_image_data(batch[key]):
+                        batch[key] = self._to_pytorch_format(batch[key])
+
         return batch
     
     def sample_sequence(
@@ -239,14 +279,14 @@ class ReplayBuffer(Dataset):
     ) -> Dict[str, np.ndarray]:
         """
         Sample sequences for action chunking.
-        
+
         Overrides parent to use current size instead of total array size.
-        
+
         Args:
             batch_size: Number of sequences to sample.
             sequence_length: Length of each sequence.
             discount: Discount factor for computing discounted returns.
-        
+
         Returns:
             Dictionary with sampled sequences including:
                 - observations: Initial observations (B, obs_dim)
@@ -261,85 +301,135 @@ class ReplayBuffer(Dataset):
         # Sample starting indices (ensure we can get full sequences)
         max_start = max(1, self.size - sequence_length)
         start_indices = np.random.randint(0, max_start, size=batch_size)
-        
+
         # Create sequence indices: (batch_size, sequence_length)
         sequence_indices = start_indices[:, None] + np.arange(sequence_length)[None, :]
         # Clip to valid range
         sequence_indices = np.clip(sequence_indices, 0, self.size - 1)
         flat_indices = sequence_indices.ravel()
-        
-        # Helper to fetch and reshape data
-        def fetch_sequence(key: str) -> np.ndarray:
-            data = self._data[key][flat_indices]
-            new_shape = (batch_size, sequence_length) + data.shape[1:]
-            return data.reshape(new_shape)
-        
-        # Fetch all sequences
-        obs_seq = fetch_sequence('observations')
-        action_seq = fetch_sequence('actions')
-        
-        # Handle next_observations (may not exist in all datasets)
-        if 'next_observations' in self._data:
-            next_obs_seq = fetch_sequence('next_observations')
+
+        # Check if observations is a dict (for image-based robomimic environments)
+        is_dict_obs = isinstance(self._data.get('observations'), dict)
+
+        if is_dict_obs:
+            # Handle dict observations
+            # Fetch sequences for each observation key
+            obs_seq = {}
+            next_obs_seq = {}
+            for obs_key in self._data['observations'].keys():
+                obs_data = self._data['observations'][obs_key][flat_indices]
+                obs_seq[obs_key] = obs_data.reshape((batch_size, sequence_length) + obs_data.shape[1:])
+
+                if 'next_observations' in self._data:
+                    next_obs_data = self._data['next_observations'][obs_key][flat_indices]
+                    next_obs_seq[obs_key] = next_obs_data.reshape((batch_size, sequence_length) + next_obs_data.shape[1:])
+
+            # Fetch initial observations
+            initial_obs = {}
+            for obs_key in self._data['observations'].keys():
+                initial_obs[obs_key] = self._data['observations'][obs_key][start_indices]
+
+            # Handle next_observations if not present
+            if 'next_observations' not in self._data:
+                next_indices = np.clip(sequence_indices + 1, 0, self.size - 1)
+                for obs_key in self._data['observations'].keys():
+                    next_obs_data = self._data['observations'][obs_key][next_indices.ravel()]
+                    next_obs_seq[obs_key] = next_obs_data.reshape((batch_size, sequence_length) + next_obs_data.shape[1:])
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                for obs_key in obs_seq.keys():
+                    if self._is_image_data(obs_seq[obs_key]):
+                        obs_seq[obs_key] = self._to_pytorch_format(obs_seq[obs_key])
+                        next_obs_seq[obs_key] = self._to_pytorch_format(next_obs_seq[obs_key])
+                        initial_obs[obs_key] = self._to_pytorch_format(initial_obs[obs_key])
         else:
-            # Use shifted observations
-            next_indices = np.clip(sequence_indices + 1, 0, self.size - 1)
-            next_obs_seq = self._data['observations'][next_indices.ravel()].reshape(
-                batch_size, sequence_length, -1
-            )
-        
+            # Handle flat observations (original behavior)
+            # Helper to fetch and reshape data
+            def fetch_sequence(key: str) -> np.ndarray:
+                data = self._data[key][flat_indices]
+                new_shape = (batch_size, sequence_length) + data.shape[1:]
+                return data.reshape(new_shape)
+
+            # Fetch all sequences
+            obs_seq = fetch_sequence('observations')
+
+            # Handle next_observations (may not exist in all datasets)
+            if 'next_observations' in self._data:
+                next_obs_seq = fetch_sequence('next_observations')
+            else:
+                # Use shifted observations
+                next_indices = np.clip(sequence_indices + 1, 0, self.size - 1)
+                next_obs_seq = self._data['observations'][next_indices.ravel()].reshape(
+                    batch_size, sequence_length, -1
+                )
+
+            # Initial observations
+            initial_obs = self._data['observations'][start_indices]
+
+            # Convert to PyTorch format if requested
+            if self.pytorch_format:
+                if self._is_image_data(obs_seq):
+                    obs_seq = self._to_pytorch_format(obs_seq)
+                    next_obs_seq = self._to_pytorch_format(next_obs_seq)
+                    initial_obs = self._to_pytorch_format(initial_obs)
+
+        # Fetch action sequences (same for both dict and flat observations)
+        action_data = self._data['actions'][flat_indices]
+        action_seq = action_data.reshape((batch_size, sequence_length) + action_data.shape[1:])
+
         # Fetch rewards
-        reward_seq = fetch_sequence('rewards')
-        
+        reward_data = self._data['rewards'][flat_indices]
+        reward_seq = reward_data.reshape((batch_size, sequence_length) + reward_data.shape[1:])
+
         # Handle masks and terminals
         if 'masks' in self._data:
-            mask_seq = fetch_sequence('masks')
+            mask_data = self._data['masks'][flat_indices]
+            mask_seq = mask_data.reshape((batch_size, sequence_length) + mask_data.shape[1:])
         else:
             mask_seq = np.ones_like(reward_seq)
-        
+
         terminal_key = 'terminals' if 'terminals' in self._data else 'dones'
         if terminal_key in self._data:
-            terminal_seq = fetch_sequence(terminal_key)
+            terminal_data = self._data[terminal_key][flat_indices]
+            terminal_seq = terminal_data.reshape((batch_size, sequence_length) + terminal_data.shape[1:])
         else:
             terminal_seq = np.zeros_like(reward_seq)
-        
+
         # Compute cumulative rewards and propagate episode information
         cumulative_rewards = np.zeros((batch_size, sequence_length))
         cumulative_masks = np.ones((batch_size, sequence_length))
         cumulative_terminals = np.zeros((batch_size, sequence_length))
         validity = np.ones((batch_size, sequence_length))
-        
+
         # Initialize first timestep
         cumulative_rewards[:, 0] = reward_seq[:, 0].squeeze()
         cumulative_masks[:, 0] = mask_seq[:, 0].squeeze()
         cumulative_terminals[:, 0] = terminal_seq[:, 0].squeeze()
-        
+
         # Propagate through sequence
         for t in range(1, sequence_length):
             # Accumulate discounted rewards
             cumulative_rewards[:, t] = (
-                cumulative_rewards[:, t-1] + 
+                cumulative_rewards[:, t-1] +
                 reward_seq[:, t].squeeze() * (discount ** t)
             )
-            
+
             # Masks: take minimum (all must be valid)
             cumulative_masks[:, t] = np.minimum(
                 cumulative_masks[:, t-1],
                 mask_seq[:, t].squeeze()
             )
-            
+
             # Terminals: take maximum (any terminal propagates)
             cumulative_terminals[:, t] = np.maximum(
                 cumulative_terminals[:, t-1],
                 terminal_seq[:, t].squeeze()
             )
-            
+
             # Validity: 0 if previous timestep was terminal
             validity[:, t] = 1.0 - cumulative_terminals[:, t-1]
-        
-        # Initial observations
-        initial_obs = self._data['observations'][start_indices]
-        
+
         result = {
             'observations': initial_obs,              # (B, obs_dim)
             'full_observations': obs_seq,             # (B, T, obs_dim)
@@ -350,13 +440,7 @@ class ReplayBuffer(Dataset):
             'terminals': cumulative_terminals,        # (B, T)
             'valid': validity,                        # (B, T)
         }
-        
-        # Convert to PyTorch format if requested
-        if self.pytorch_format:
-            for key in ['observations', 'full_observations', 'next_observations']:
-                if key in result and self._is_image_data(result[key]):
-                    result[key] = self._to_pytorch_format(result[key])
-        
+
         return result
     
     def get_statistics(self) -> Dict[str, Any]:
