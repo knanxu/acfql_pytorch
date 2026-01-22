@@ -354,9 +354,9 @@ class MFBCAgent:
             else:
                 condition = observations
 
-        s = torch.zeros(self.config['batch_size'],device=self.device)
-        t = torch.ones_like(s,device=self.device)
-        actions = self.flow_map(noises,s,t,condition)
+        s = torch.zeros(batch_size, device=self.device)
+        t = torch.ones_like(s, device=self.device)
+        actions = self.flow_map(actions, s, t, condition)
 
         # Clamp actions to valid range
         actions = torch.clamp(actions, -1, 1)
