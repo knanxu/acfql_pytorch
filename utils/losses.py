@@ -653,6 +653,7 @@ def imf_loss(
         _, grad_xst_b = flow_map.jvp_x(s, t, Is, vs, obs_emb)
     # Expand (t-s) to match dimensions
     # t_diff = (t - s).view(-1, 1, 1) if act_0.ndim == 3 else (t - s).view(-1, 1)
+    t_diff = t-s
     t_diff = at_least_ndim(t_diff,act_1.dim())
     error = u_xst - t_diff * (grad_xst_b + duds)
     imf_term = get_norm(error, config.norm_type) ** 2
