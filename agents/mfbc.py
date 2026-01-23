@@ -356,7 +356,7 @@ class MFBCAgent:
 
         s = torch.zeros(batch_size, device=self.device)
         t = torch.ones_like(s, device=self.device)
-        actions = self.flow_map(actions, s, t, condition)
+        actions = self.flow_map(s, t, actions, condition)
 
         # Clamp actions to valid range
         actions = torch.clamp(actions, -1, 1)
