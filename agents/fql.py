@@ -1,17 +1,15 @@
 """
-Flow Q-Learning (FQL) Agent (PyTorch Implementation)
+Behavior Cloning Agent with Flow Matching (PyTorch Implementation)
 
-Implements FQL algorithm with:
-- Flow-based action modeling (continuous normalizing flow)
-- Action chunking support
-- Critic network for Q-learning
-- Distillation policy for one-step action generation
+Adapted from JAX/Flax ACFQLAgent to pure BC with flow matching.
+Keeps critic structure for future RL experiments.
 
 Supports:
 - Encoder types: 'identity', 'mlp', 'image' (ResNet-based), 'impala'
-- Policy types: 'mlp' (ActorVectorField)
+- Policy types: 'mlp', 'chiunet', 'chitransformer', 'jannerunet'
 - Multi-modal observations (multiple cameras + proprioceptive data)
 - Action chunking with flexible horizon lengths
+- Multiple loss types via unified loss module
 
 Config is passed as a dictionary (similar to JAX version).
 """
@@ -29,90 +27,98 @@ from utils.flow_map import FlowMap
 from utils.interpolant import Interpolant
 from utils.networks import MLP, VanillaMLP, ChiUNet, ChiTransformer, JannerUNet, Value
 from utils.encoders import IdentityEncoder, MLPEncoder, MultiImageObsEncoder
+from utils.losses import get_loss_fn, OptimizationConfig
 
 
-class FQLAgent:
+class ACFQLAgent:
     """
-    Flow Q-Learning Agent.
+    Behavior Cloning Agent using Flow Matching.
 
     Features:
     - Flow-based action modeling (continuous normalizing flow)
     - Action chunking support (predict multiple future actions)
     - Visual encoders: ResNet-based, IMPALA, MLP, Identity
+    - Policy networks: MLP, ChiUNet, ChiTransformer, JannerUNet
     - Multi-modal observations (multiple cameras + proprioceptive data)
-    - Critic network for Q-learning
-    - Distillation policy for one-step action generation
+    - Critic network structure (for future RL fine-tuning)
 
     Config is passed as a dictionary (similar to JAX version).
     """
-
+    
     def __init__(
         self,
         actor: nn.Module,
-        actor_onestep: nn.Module,
+        onestep_actor:nn.Module,
         critic: nn.Module,
         target_critic: nn.Module,
         actor_optimizer: optim.Optimizer,
+        onestep_actor_optimizer:optim.Optimizer,
         critic_optimizer: optim.Optimizer,
         config: Dict[str, Any],
         encoder: Optional[nn.Module] = None,
-        critic_encoder: Optional[nn.Module] = None,
         flow_map: Optional[FlowMap] = None,
-        flow_map_onestep: Optional[FlowMap] = None,
+        onestep_flow_map:Optional[FlowMap] = None,
         interpolant: Optional[Interpolant] = None,
     ):
-        """Initialize FQL Agent.
+        """Initialize BC Agent.
 
         Args:
-            actor: Flow network (multi-step policy)
-            actor_onestep: One-step distillation policy
-            critic: Critic network
+            actor: Policy network (flow model)
+            critic: Critic network (for RL fine-tuning)
             target_critic: Target critic network
             actor_optimizer: Optimizer for actor (and encoder if present)
             critic_optimizer: Optimizer for critic
             config: Configuration dictionary
-            encoder: Optional visual encoder for actor
-            critic_encoder: Optional visual encoder for critic
+            encoder: Optional visual encoder for actor and critic 
             flow_map: FlowMap wrapper for actor network
-            flow_map_onestep: FlowMap wrapper for one-step actor
             interpolant: Interpolant for flow matching
         """
-        self.actor = actor  # Flow network (like BCAgent)
-        self.actor_onestep = actor_onestep  # One-step distillation policy
+        self.actor = actor
         self.critic = critic
         self.target_critic = target_critic
         self.actor_optimizer = actor_optimizer
         self.critic_optimizer = critic_optimizer
         self.config = config
         self.encoder = encoder
-        self.critic_encoder = critic_encoder
 
         # Flow matching components
         self.flow_map = flow_map
-        self.flow_map_onestep = flow_map_onestep
+        self.onestep_flow_map = onestep_flow_map
         self.interpolant = interpolant
 
         self.device = torch.device(config['device'])
 
         # Move models to device
         self.actor.to(self.device)
-        self.actor_onestep.to(self.device)
         self.critic.to(self.device)
         self.target_critic.to(self.device)
         if self.encoder is not None:
             self.encoder.to(self.device)
-        if self.critic_encoder is not None:
-            self.critic_encoder.to(self.device)
         if self.flow_map is not None:
             self.flow_map.to(self.device)
-        if self.flow_map_onestep is not None:
-            self.flow_map_onestep.to(self.device)
+        if self.onestep_flow_map is not None:
+            self.onestep_flow_map.to(self.device)
 
-        # Get policy type from config
+        # Get policy type from config (check both network_type and policy_type for compatibility)
         self.policy_type = config.get('network_type', config.get('policy_type', 'mlp'))
 
         # Training step counter
         self.step = 0
+        self.train_phase='offline'
+
+        # Create OptimizationConfig for loss functions
+        self.opt_config = OptimizationConfig(
+            loss_type=config.get('loss_type', 'flow'),
+            loss_scale=config.get('loss_scale', 100.0),
+            norm_type=config.get('norm_type', 'l2'),
+            t_two_step=config.get('t_two_step', 0.9),
+            discrete_dt=config.get('discrete_dt', 0.01),
+            interp_type=config.get('interp_type', 'linear'),
+        )
+
+        # Get loss function based on loss_type
+        self.loss_fn = get_loss_fn(config.get('loss_type', 'flow'))
+
         # Compile models for faster training (torch.compile)
         self.use_compile = config.get('use_compile', True)
         if self.use_compile:
@@ -123,26 +129,27 @@ class FQLAgent:
                 print(f"🚀 Compiling encoder with torch.compile (mode={compile_mode})...")
                 self.encoder = torch.compile(self.encoder, mode=compile_mode)
             print("✓ Compilation complete!")
-
-
+    
     def _encode_observations(self, observations: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
-        """Encode observations using the encoder if present."""
+        """Encode observations using the encoder if present.
+        
+        Args:
+            observations: Raw observations (tensor or dict for multi-image)
+        
+        Returns:
+            Encoded observations tensor
+        """
         if self.encoder is not None:
             return self.encoder(observations)
         return observations
     
     def actor_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute FQL actor loss.
-
-        Includes:
-        - BC flow loss (flow matching)
-        - Distillation loss (train one-step to match flow)
-        - Q loss (maximize Q value)
+        Compute BC flow matching loss using unified loss module.
 
         Args:
             batch: Dictionary containing:
-                - observations: (B, obs_dim) or (B, C, H, W)
+                - observations: (B, obs_dim) or (B, C, H, W) or Dict[str, Tensor]
                 - actions: (B, action_dim) or (B, T, action_dim) if chunking
                 - valid: (B, T) mask for action chunks (optional)
 
@@ -160,196 +167,73 @@ class FQLAgent:
         else:
             batch_size = observations.shape[0]
 
-        # Encode observations if using separate encoder
-        obs_emb = self._encode_observations(observations)
-
         # Handle action chunking - determine format based on policy type
         action_dim = self.config['action_dim']
-        horizon_length = self.config.get('horizon_length', 5)
+        horizon_length = self.config.get('horizon_length', 1)
 
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
-            # U-Net/Transformer policies expect (B, T, act_dim)
-            if actions.ndim == 2:
-                # Reshape flat actions to (B, T, act_dim)
-                batch_actions = actions.reshape(batch_size, horizon_length, action_dim)
-            else:
-                batch_actions = actions
-
-            # Flow matching with interpolant
-            x_0 = torch.randn_like(batch_actions)
-            x_1 = batch_actions
-
-            # Sample random time
-            t = torch.rand(batch_size, device=self.device)
-
-            # Use interpolant to compute x_t and target velocity
-            x_t = self.interpolant.calc_It(t, x_0, x_1)
-            target_vel = self.interpolant.calc_It_dot(t, x_0, x_1)
-
-            # Predict velocity using flow_map
-            if self.encoder is not None:
-                pred_vel = self.flow_map.get_velocity(t, x_t, obs_emb)
-            else:
-                pred_vel = self.flow_map.get_velocity(t, x_t, observations)
-
-            # Compute loss using L2 norm (aligned with mip/losses.py flow_loss)
-            loss_scale = self.config.get('loss_scale', 100.0)
-            norm_type = self.config.get('norm_type', 'l2')
-
-            if norm_type == 'l2':
-                loss_per_sample = torch.norm(pred_vel - target_vel, p=2, dim=-1) ** 2  # (B, T)
-            else:
-                loss_per_sample = torch.norm(pred_vel - target_vel, p=1, dim=-1) ** 2  # (B, T)
-
-            if 'valid' in batch:
-                valid = batch['valid']  # (B, T)
-                bc_flow_loss = loss_scale * (loss_per_sample * valid).mean()
-            else:
-                bc_flow_loss = loss_scale * loss_per_sample.mean()
+        # Prepare actions in (B, T, act_dim) format for loss functions
+        if actions.ndim == 2:
+            batch_actions = actions.reshape(batch_size, horizon_length, action_dim)
         else:
-            # MLP-based policy expects flat (B, act_dim * T)
-            if self.config.get('action_chunking', True):
-                if actions.ndim == 3:
-                    batch_actions = actions.reshape(batch_size, -1)
-                else:
-                    batch_actions = actions
-            else:
-                if actions.ndim == 3:
-                    batch_actions = actions[:, 0, :]
-                else:
-                    batch_actions = actions
+            batch_actions = actions
 
-            # Flow matching with interpolant
-            x_0 = torch.randn_like(batch_actions)
-            x_1 = batch_actions
-
-            # Sample random time
-            t = torch.rand(batch_size, device=self.device)
-
-            # Use interpolant to compute x_t and target velocity
-            x_t = self.interpolant.calc_It(t, x_0, x_1)
-            target_vel = self.interpolant.calc_It_dot(t, x_0, x_1)
-
-            # Predict velocity (pass encoded observations)
-            # For MLP, we need to reshape to (B, T, act_dim) format for flow_map
-            x_t_reshaped = x_t.reshape(batch_size, horizon_length, action_dim)
-            if self.encoder is not None:
-                # Ensure obs_emb has sequence dimension
-                if obs_emb.ndim == 2:
-                    obs_emb_seq = obs_emb.unsqueeze(1)  # (B, 1, emb_dim)
-                else:
-                    obs_emb_seq = obs_emb
-                pred_vel_reshaped = self.flow_map.get_velocity(t, x_t_reshaped, obs_emb_seq)
-            else:
-                # Ensure observations has sequence dimension
-                if isinstance(observations, dict):
-                    obs_seq = observations
-                elif observations.ndim == 2:
-                    obs_seq = observations.unsqueeze(1)  # (B, 1, obs_dim)
-                else:
-                    obs_seq = observations
-                pred_vel_reshaped = self.flow_map.get_velocity(t, x_t_reshaped, obs_seq)
-
-            # Reshape back to flat format
-            pred_vel = pred_vel_reshaped.reshape(batch_size, -1)
-
-            # Compute loss using L2 norm (aligned with mip/losses.py flow_loss)
-            loss_scale = self.config.get('loss_scale', 100.0)
-            norm_type = self.config.get('norm_type', 'l2')
-
-            # Reshape for norm calculation: (B, T, act_dim)
-            pred_vel_3d = pred_vel.reshape(batch_size, horizon_length, action_dim)
-            target_vel_3d = target_vel.reshape(batch_size, horizon_length, action_dim)
-
-            if norm_type == 'l2':
-                loss_per_sample = torch.norm(pred_vel_3d - target_vel_3d, p=2, dim=-1) ** 2  # (B, T)
-            else:
-                loss_per_sample = torch.norm(pred_vel_3d - target_vel_3d, p=1, dim=-1) ** 2
-
-            if self.config.get('action_chunking', True) and 'valid' in batch:
-                valid = batch['valid']  # (B, T)
-                bc_flow_loss = loss_scale * (loss_per_sample * valid).mean()
-            else:
-                bc_flow_loss = loss_scale * loss_per_sample.mean()
-
-        # === Distillation Loss ===
-        # Train one-step actor to match flow actions
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
-            noises = torch.randn(batch_size, horizon_length, action_dim, device=self.device)
+        # Prepare observations for encoder
+        # Ensure observations has sequence dimension for encoder
+        if isinstance(observations, dict):
+            obs_for_encoder = observations
+        elif observations.ndim == 2:
+            obs_for_encoder = observations.unsqueeze(1)  # (B, 1, obs_dim)
         else:
-            full_action_dim = action_dim * horizon_length if self.config.get('action_chunking', True) else action_dim
-            noises = torch.randn(batch_size, full_action_dim, device=self.device)
+            obs_for_encoder = observations
 
-        with torch.no_grad():
-            target_flow_actions = self.compute_flow_actions(observations, noises)
+        # Create delta_t tensor for loss function
+        delta_t = torch.ones(batch_size, device=self.device)
 
-        # One-step actor prediction
-        actor_actions = self.compute_onestep_actions(observations, noises)
-        distill_loss = ((actor_actions - target_flow_actions) ** 2).mean()
-
-        # === Q Loss ===
-        # Maximize Q value for one-step actions
-        actor_actions_clipped = torch.clamp(actor_actions, -1, 1)
-
-        # Flatten actions if needed for critic (critic expects flat actions)
-        if actor_actions_clipped.ndim == 3:
-            actor_actions_flat = actor_actions_clipped.reshape(batch_size, -1)
-        else:
-            actor_actions_flat = actor_actions_clipped
-
-        # Encode observations for critic if needed
-        if self.critic_encoder is not None:
-            obs_emb_critic = self.critic_encoder(observations)
-            # Flatten obs_emb_critic if it has sequence dimension
-            if obs_emb_critic.ndim == 3:
-                obs_emb_critic = obs_emb_critic.reshape(batch_size, -1)
-            qs = self.critic(obs_emb_critic, actor_actions_flat)
-        else:
-            # Flatten observations if needed
-            if isinstance(observations, dict):
-                obs_flat = observations
-            elif observations.ndim == 3:
-                obs_flat = observations.reshape(batch_size, -1)
-            else:
-                obs_flat = observations
-            qs = self.critic(obs_flat, actor_actions_flat)
-        q = qs.mean(dim=0)  # Mean over ensemble
+        # Call unified loss function
+        bc_flow_loss, loss_info = self.loss_fn(
+            config=self.opt_config,
+            flow_map=self.flow_map,
+            encoder=self.encoder,
+            interp=self.interpolant,
+            act=batch_actions,
+            obs=obs_for_encoder,
+            delta_t=delta_t,
+        )
+        #compute ditill loss with one-step policy
+        observations = self._encode_observations(obs_for_encoder)
+        noises = torch.randn_like(batch_actions)
+        target_flow_actions = self.compute_flow_actions(observations,noises)
+        s = torch.zeros(batch_size, device=self.device)
+        t = torch.ones_like(s, device=self.device)
+        actions = self.onestep_flow_map(s, t, noises,observations)
+        distill_loss = torch.mean((actions - target_flow_actions) ** 2)
+        actor_actions = torch.clamp(actor_actions,-1,1)
+        actor_actions = actor_actions.reshape(batch_size,horizon_length*action_dim)
+        qs = self.critic(observations,actions=actor_actions)
+        q =torch.mean(qs,dim=0)
         q_loss = -q.mean()
 
-        # Total actor loss
-        total_loss = self.config['bc_weight'] * bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
+        total_loss = self.config.get('bc_weight', 1.0) * bc_flow_loss + self.config.get('alpha',10000) * distill_loss +q_loss
 
         info = {
             'actor_loss': total_loss.item(),
             'bc_flow_loss': bc_flow_loss.item(),
-            'distill_loss': distill_loss.item(),
-            'q_loss': q_loss.item(),
+            'distill_loss':distill_loss.item(),
         }
+        # Add any additional info from loss function
+        for k, v in loss_info.items():
+            info[k] = v
 
         return total_loss, info
     
     def critic_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute FQL critic loss (TD loss).
-
-        Args:
-            batch: Dictionary containing:
-                - observations: (B, obs_dim)
-                - actions: (B, action_dim)
-                - next_observations: (B, obs_dim)
-                - rewards: (B,)
-                - masks: (B,) - 1 if not done, 0 if done
-
-        Returns:
-            loss: Scalar critic loss
-            info: Dictionary of logging information
+        Compute critic loss (placeholder for future RL).
+        
+        For BC training, this returns zero loss.
         """
         observations = batch['observations']
         actions = batch['actions']
-        next_observations = batch.get('next_observations', observations)
-        rewards = batch['rewards']
-        masks = batch.get('masks', 1.0 - batch.get('terminals', torch.zeros_like(rewards)))
-
         # Get batch size
         if isinstance(observations, dict):
             first_key = list(observations.keys())[0]
@@ -357,184 +241,106 @@ class FQLAgent:
         else:
             batch_size = observations.shape[0]
 
-        # Encode observations for critic if needed
-        if self.critic_encoder is not None:
-            obs_emb = self.critic_encoder(observations)
-            next_obs_emb = self.critic_encoder(next_observations)
-            # Flatten if sequence dimension exists
-            if obs_emb.ndim == 3:
-                obs_emb = obs_emb.reshape(batch_size, -1)
-            if next_obs_emb.ndim == 3:
-                next_obs_emb = next_obs_emb.reshape(batch_size, -1)
-        else:
-            # Flatten observations if needed
-            if isinstance(observations, dict):
-                obs_emb = observations
-                next_obs_emb = next_observations
-            elif observations.ndim == 3:
-                obs_emb = observations.reshape(batch_size, -1)
-                next_obs_emb = next_observations.reshape(batch_size, -1)
-            else:
-                obs_emb = observations
-                next_obs_emb = next_observations
-
-        # Handle action chunking
+        # Handle action chunking - determine format based on policy type
         action_dim = self.config['action_dim']
-        horizon_length = self.config.get('horizon_length', 5)
+        horizon_length = self.config.get('horizon_length', 1)
 
-        if self.config.get('action_chunking', True):
-            if actions.ndim == 3:
-                batch_actions = actions.reshape(batch_size, -1)
-            else:
-                batch_actions = actions
-
-            if next_observations.ndim == 3:
-                next_obs = next_observations[:, -1, :]
-            else:
-                next_obs = next_observations
-
-            if rewards.ndim == 2:
-                last_reward = rewards[:, -1]
-                last_mask = masks[:, -1] if masks.ndim == 2 else masks
-            else:
-                last_reward = rewards
-                last_mask = masks
+        # Prepare actions in (B, T, act_dim) format for loss functions
+        if actions.ndim == 2:
+            batch_actions = actions.reshape(batch_size, horizon_length, action_dim)
         else:
-            if actions.ndim == 3:
-                batch_actions = actions[:, 0, :]
-            else:
-                batch_actions = actions
-            next_obs = next_observations
-            last_reward = rewards if rewards.ndim == 1 else rewards[:, 0]
-            last_mask = masks if masks.ndim == 1 else masks[:, 0]
+            batch_actions = actions
 
-        # Compute target Q value
-        with torch.no_grad():
-            # Sample next actions using one-step policy
-            if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
-                noises = torch.randn(batch_size, horizon_length, action_dim, device=self.device)
-            else:
-                full_action_dim = action_dim * horizon_length if self.config.get('action_chunking', True) else action_dim
-                noises = torch.randn(batch_size, full_action_dim, device=self.device)
-
-            # Compute next actions using one-step policy
-            next_actions = self.compute_onestep_actions(next_obs, noises)
-            next_actions = torch.clamp(next_actions, -1, 1)
-
-            # Flatten next_actions if needed for critic (critic expects flat actions)
-            if next_actions.ndim == 3:
-                next_actions_flat = next_actions.reshape(batch_size, -1)
-            else:
-                next_actions_flat = next_actions
-
-            # Compute target Q values
-            if self.critic_encoder is not None:
-                # Encode next observations for critic
-                next_obs_emb_critic = self.critic_encoder(next_obs)
-                if next_obs_emb_critic.ndim == 3:
-                    next_obs_emb_critic = next_obs_emb_critic.reshape(batch_size, -1)
-                next_qs = self.target_critic(next_obs_emb_critic, next_actions_flat)  # (num_ensembles, B)
-            else:
-                # Flatten next_obs if needed
-                if isinstance(next_obs, dict):
-                    next_obs_flat = next_obs
-                elif next_obs.ndim == 3:
-                    next_obs_flat = next_obs.reshape(batch_size, -1)
-                else:
-                    next_obs_flat = next_obs
-                next_qs = self.target_critic(next_obs_flat, next_actions_flat)  # (num_ensembles, B)
-
-            if self.config.get('q_agg', 'mean') == 'min':
-                next_q = next_qs.min(dim=0)[0]
-            else:
-                next_q = next_qs.mean(dim=0)
-
-            # Compute TD target
-            discount_factor = self.config['discount'] ** (horizon_length if self.config.get('action_chunking', True) else 1)
-            target_q = last_reward + discount_factor * last_mask * next_q
-
-        # Compute current Q values
-        current_qs = self.critic(obs_emb, batch_actions)  # (num_ensembles, B)
-
-        # Get valid mask (critical for action chunking - masks out cross-episode samples)
-        if 'valid' in batch:
-            valid = batch['valid']
-            if valid.ndim == 2:
-                # Use last timestep's validity for TD target
-                last_valid = valid[:, -1]
-            else:
-                last_valid = valid
+        # Prepare observations for encoder
+        # Ensure observations has sequence dimension for encoder
+        if isinstance(observations, dict):
+            obs_for_encoder = observations
+        elif observations.ndim == 2:
+            obs_for_encoder = observations.unsqueeze(1)  # (B, 1, obs_dim)
         else:
-            last_valid = torch.ones(batch_size, device=self.device)
+            obs_for_encoder = observations
+        # rng, sample_rng = jax.random.split(rng)
+        # next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
 
-        # Compute critic loss with valid mask (MSE for each ensemble, then mean)
-        # This is critical to avoid Q-value explosion from cross-episode samples
-        td_errors = (current_qs - target_q.unsqueeze(0)) ** 2  # (num_ensembles, B)
-        critic_loss = (td_errors * last_valid.unsqueeze(0)).mean()
+        # next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
+        # if self.config['q_agg'] == 'min':
+        #     next_q = next_qs.min(axis=0)
+        # else:
+        #     next_q = next_qs.mean(axis=0)
+        
+        # target_q = batch['rewards'][..., -1] + \
+        #     (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
 
-        info = {
-            'critic_loss': critic_loss.item(),
-            'q_mean': current_qs.mean().item(),
-            'q_max': current_qs.max().item(),
-            'q_min': current_qs.min().item(),
-            'target_q_mean': target_q.mean().item(),
+        # q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
+        
+        # critic_loss = (jnp.square(q - target_q) * batch['valid'][..., -1]).mean()
+        next_actions = self.sample_actions(batch['next_observations'][..., -1,:])
+        next_qs = self.target_critic(batch['next_observations'][..., -1, :], actions=next_actions)
+        if self.config['q_agg'] == 'min':
+            next_q = next_qs.min(axis=0)
+        else:
+            next_q = next_qs.mean(axis=0)
+        target_q = batch['rewards'][..., -1] + \
+             (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
+        actions = batch_actions.reshape(batch_size,horizon_length * action_dim)
+        q = self.critic(batch['observations'], actions=actions)
+        critic_loss = (torch.square(q - target_q) * batch['valid'][..., -1]).mean()
+        
+        # Return zero loss for BC-only training
+        return torch.tensor(0.0, device=self.device), {
+            'critic_loss': critic_loss,
+            'q_mean': q.mean(),
+            'q_max': q.max(),
+            'q_min': q.min(),
         }
-
-        return critic_loss, info
+        
+        # TODO: Implement for RL fine-tuning
+        raise NotImplementedError("Critic loss for RL not implemented yet")
     
-    def total_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    def total_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute total loss (actor + critic)."""
         info = {}
         
-        # Actor loss
+        # Actor loss (BC flow matching)
         actor_loss, actor_info = self.actor_loss(batch)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
         
-        # Critic loss
+        # Critic loss (zero for BC, can be activated for RL)
         critic_loss, critic_info = self.critic_loss(batch)
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
         
-        info['total_loss'] = (actor_loss + critic_loss).item()
+        total = actor_loss + critic_loss
+        info['total_loss'] = total.item()
         
-        return actor_loss, critic_loss, info
+        return total, info
     
     def _update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Single update step."""
-        # Compute losses
-        actor_loss, critic_loss, info = self.total_loss(batch)
+        # Compute loss
+        loss, info = self.total_loss(batch)
 
         # Update actor
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        loss.backward()
 
         # Apply gradient clipping (aligned with mip/config.py)
         grad_clip_norm = self.config.get('grad_clip_norm', 10.0)
         if grad_clip_norm > 0:
-            # Collect all actor parameters for gradient clipping
-            params_to_clip = list(self.actor.parameters()) + list(self.actor_onestep.parameters())
+            # Collect all parameters for gradient clipping
+            params_to_clip = list(self.actor.parameters())
             if self.encoder is not None:
                 params_to_clip += [p for p in self.encoder.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip_norm)
 
         self.actor_optimizer.step()
 
-        # Update critic
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-
-        # Apply gradient clipping to critic
-        if grad_clip_norm > 0:
-            critic_params_to_clip = list(self.critic.parameters())
-            if self.critic_encoder is not None:
-                critic_params_to_clip += [p for p in self.critic_encoder.parameters() if p.requires_grad]
-            torch.nn.utils.clip_grad_norm_(critic_params_to_clip, grad_clip_norm)
-
-        self.critic_optimizer.step()
-
-        # Update target network
-        self.target_update()
+        # Update critic (if used)
+        if self.config.get('use_critic', False):
+            self.critic_optimizer.zero_grad()
+            self.critic_optimizer.step()
+            self.target_update()
 
         self.step += 1
 
@@ -543,28 +349,34 @@ class FQLAgent:
     def update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """
         Perform one update step.
-        
+
         Args:
-            batch: Dictionary of batched data
-        
+            batch: Dictionary of batched data (already on device)
+
         Returns:
             info: Dictionary of logging information
         """
-
         # Mark CUDA graph step boundary for torch.compile
         if self.use_compile and torch.cuda.is_available():
             torch.compiler.cudagraph_mark_step_begin()
 
+        # Helper function to move to device
+        def to_device(x):
+            if isinstance(x, torch.Tensor):
+                return x.to(self.device)
+            elif isinstance(x, dict):
+                return {k: to_device(v) for k, v in x.items()}
+            return x
+
         # Move batch to device if needed
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                 for k, v in batch.items()}
-        
+        batch = {k: to_device(v) for k, v in batch.items()}
+
         return self._update(batch)
     
     def batch_update(
         self, 
         batches: Dict[str, torch.Tensor]
-    ) -> Tuple['FQLAgent', Dict[str, float]]:
+    ) -> Tuple['ACFQLAgent', Dict[str, float]]:
         """
         Perform multiple updates (one per batch).
         
@@ -592,6 +404,9 @@ class FQLAgent:
     
     def target_update(self):
         """Soft update of target critic network."""
+        if not self.config.get('use_critic', False):
+            return
+        
         tau = self.config['tau']
         for target_param, param in zip(
             self.target_critic.parameters(), 
@@ -600,7 +415,7 @@ class FQLAgent:
             target_param.data.copy_(
                 tau * param.data + (1 - tau) * target_param.data
             )
-    
+
     @torch.no_grad()
     def compute_flow_actions(
         self,
@@ -632,14 +447,19 @@ class FQLAgent:
 
         flow_steps = self.config.get('flow_steps', 10)
         action_dim = self.config['action_dim']
-        horizon_length = self.config.get('horizon_length', 5)
+        horizon_length = self.config.get('horizon_length', 1)
 
         # Ensure actions are in (B, T, act_dim) format for flow_map
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
+        
+        # Ensure noises has correct shape (B, T, act_dim)
+        if noises.ndim == 2:
+            # Could be (B, T*act_dim) flat format, reshape it
+            actions = noises.reshape(batch_size, horizon_length, action_dim)
+        elif noises.ndim == 3:
             actions = noises  # Already (B, T, act_dim)
         else:
-            # MLP-based policy - reshape to (B, T, act_dim)
-            actions = noises.reshape(batch_size, horizon_length, action_dim)
+            raise ValueError(f"Unexpected noises shape: {noises.shape}")
+        
 
         # Ensure obs_emb has correct format
         if self.encoder is not None:
@@ -660,6 +480,7 @@ class FQLAgent:
             s_val = i / flow_steps
             t_val = (i + 1) / flow_steps
             s = torch.full((batch_size,), s_val, device=self.device)
+            t = torch.full((batch_size,), t_val, device=self.device)
 
             # Get velocity at current state (key fix: use get_velocity, not forward)
             b_s = self.flow_map.get_velocity(s, actions, condition)
@@ -678,88 +499,20 @@ class FQLAgent:
         return actions
 
     @torch.no_grad()
-    def compute_onestep_actions(
-        self,
-        observations: Union[torch.Tensor, Dict[str, torch.Tensor]],
-        noises: torch.Tensor,
-    ):
-        """Compute actions from the one-step distillation policy.
-
-        Uses ODE sampling aligned with much-ado-about-noising/mip/samplers.py:
-        - One-step: directly map from t=0 to t=1 using get_velocity
-
-        Args:
-            observations: Raw or encoded observations
-            noises: Initial noise tensor
-
-        Returns:
-            Predicted actions
-        """
-        # Encode observations if needed
-        obs_emb = self._encode_observations(observations)
-
-        # Get batch size
-        if isinstance(obs_emb, dict):
-            first_key = list(obs_emb.keys())[0]
-            batch_size = obs_emb[first_key].shape[0]
-        else:
-            batch_size = obs_emb.shape[0]
-
-        action_dim = self.config['action_dim']
-        horizon_length = self.config.get('horizon_length', 5)
-
-        # Ensure actions are in (B, T, act_dim) format for flow_map
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
-            actions = noises  # Already (B, T, act_dim)
-        else:
-            # MLP-based policy - reshape to (B, T, act_dim)
-            actions = noises.reshape(batch_size, horizon_length, action_dim)
-
-        # Ensure obs_emb has correct format
-        if self.encoder is not None:
-            if not isinstance(obs_emb, dict) and obs_emb.ndim == 2:
-                obs_emb = obs_emb.unsqueeze(1)  # (B, 1, emb_dim)
-            condition = obs_emb
-        else:
-            if isinstance(observations, dict):
-                condition = observations
-            elif observations.ndim == 2:
-                condition = observations.unsqueeze(1)  # (B, 1, obs_dim)
-            else:
-                condition = observations
-
-        # One-step: directly map from t=0 to t=1
-        s = torch.zeros(batch_size, device=self.device)
-
-        # Get velocity at t=0 and apply one-step update
-        b_s = self.flow_map_onestep.get_velocity(s, actions, condition)
-        actions = actions + b_s * 1.0  # dt = 1.0 for one-step
-
-        # Clamp actions to valid range
-        actions = torch.clamp(actions, -1, 1)
-
-        # Reshape back to flat format for MLP
-        if self.policy_type not in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
-            actions = actions.reshape(batch_size, -1)
-
-        return actions
-
-    @torch.no_grad()
     def sample_actions(
         self,
         observations: Union[torch.Tensor, Dict[str, torch.Tensor], np.ndarray],
-        temperature: float = 1.0,
+        temperature: float = 0.0,
     ) -> np.ndarray:
-        """Sample actions using the trained policy.
-
-        Uses the one-step distillation policy for fast inference.
-
+        """
+        Sample actions using the trained flow model.
+        
         Args:
-            observations: Observations
-            temperature: Sampling temperature (for noise scaling)
-
+            observations: (B, obs_dim) or (B, C, H, W) or Dict[str, Tensor]
+            temperature: Sampling temperature (0 = deterministic)
+        
         Returns:
-            actions: numpy array
+            actions: (B, action_dim * horizon_length) flattened
         """
         # Helper to convert to torch
         def to_torch(x):
@@ -770,9 +523,9 @@ class FQLAgent:
             elif isinstance(x, torch.Tensor):
                 return x.to(self.device)
             return x
-
+        
         observations = to_torch(observations)
-
+        
         # Ensure batch dimension exists
         if isinstance(observations, dict):
             first_key = list(observations.keys())[0]
@@ -783,36 +536,30 @@ class FQLAgent:
             if observations.ndim == 1:
                 observations = observations.unsqueeze(0)
             batch_size = observations.shape[0]
-
+        
         action_dim = self.config['action_dim']
-        horizon_length = self.config.get('horizon_length', 5)
+        horizon_length = self.config.get('horizon_length', 1)
 
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
-            # U-Net/Transformer policies work with (B, T, act_dim)
-            noises = torch.randn(batch_size, horizon_length, action_dim, device=self.device)
-        else:
-            # Start with noise in flat format
-            full_action_dim = action_dim * horizon_length if self.config.get('action_chunking', True) else action_dim
-            noises = torch.randn(batch_size, full_action_dim, device=self.device)
-
-        if temperature != 1.0:
-            noises = noises * temperature
-
-        # Use one-step policy for fast inference
-        actions = self.compute_onestep_actions(observations, noises)
+        actions = torch.randn(batch_size, horizon_length, action_dim, device=self.device)
+        if temperature > 0:
+            actions = actions * temperature
+        
+        # Integrate flow using Euler method
+        s = torch.zeros(batch_size, device=self.device)
+        t = torch.ones_like(s, device=self.device)
+        actions = self.onestep_flow_map(s, t, actions,observations)
 
         # Reshape to flat format if needed
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
+        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
             # (B, T, act_dim) -> (B, T * act_dim)
             actions = actions.reshape(batch_size, -1)
 
         return actions.cpu().numpy()
-
+    
     def save(self, path: str):
         """Save agent checkpoint."""
         save_dict = {
             'actor': self.actor.state_dict(),
-            'actor_onestep': self.actor_onestep.state_dict(),
             'critic': self.critic.state_dict(),
             'target_critic': self.target_critic.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
@@ -822,8 +569,8 @@ class FQLAgent:
         }
         if self.encoder is not None:
             save_dict['encoder'] = self.encoder.state_dict()
-        if self.critic_encoder is not None:
-            save_dict['critic_encoder'] = self.critic_encoder.state_dict()
+        # Note: flow_map and interpolant don't have learnable parameters,
+        # so we don't need to save them. They will be recreated on load.
 
         torch.save(save_dict, path)
         print(f"Agent saved to {path}")
@@ -832,16 +579,14 @@ class FQLAgent:
         """Load agent checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(checkpoint['actor'])
-        self.actor_onestep.load_state_dict(checkpoint['actor_onestep'])
         self.critic.load_state_dict(checkpoint['critic'])
         self.target_critic.load_state_dict(checkpoint['target_critic'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
         if self.encoder is not None and 'encoder' in checkpoint:
             self.encoder.load_state_dict(checkpoint['encoder'])
-        if self.critic_encoder is not None and 'critic_encoder' in checkpoint:
-            self.critic_encoder.load_state_dict(checkpoint['critic_encoder'])
         self.step = checkpoint.get('step', 0)
+        # Note: flow_map and interpolant are already created in __init__
         print(f"Agent loaded from {path} (step {self.step})")
     
     @classmethod
@@ -850,9 +595,9 @@ class FQLAgent:
         observation_shape: Union[Tuple[int, ...], Dict],
         action_dim: int,
         config: Dict[str, Any],
-    ) -> 'FQLAgent':
+    ) -> 'ACFQLAgent':
         """
-        Create a new FQL agent.
+        Create a new BC agent.
 
         Args:
             observation_shape: Shape of observations
@@ -860,10 +605,16 @@ class FQLAgent:
                 - For images: (C, H, W) tuple
                 - For multi-image: shape_meta dict (from robomimic_image_utils)
             action_dim: Dimension of action space
-            config: Agent configuration dictionary
+            config: Agent configuration dictionary with keys:
+                - encoder: 'identity', 'mlp', 'image', 'impala'
+                - network_type: 'mlp', 'chiunet', 'chitransformer', 'jannerunet'
+                - emb_dim: Encoder output dimension (default 256)
+                - horizon_length: Action chunking length
+                - action_chunking: Enable action chunking
+                - ... other standard config options
 
         Returns:
-            agent: Initialized FQL agent
+            agent: Initialized BC agent
         """
         config = dict(config)  # Copy to avoid mutation
         config['action_dim'] = action_dim
@@ -953,21 +704,9 @@ class FQLAgent:
 
         print(f"✓ Created encoder: {encoder_type} (output_dim={network_input_dim})")
 
-        # ===== Create Policy Networks =====
+        # ===== Create Policy Network =====
         if network_type == 'mlp':
             actor = MLP(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                emb_dim=config.get('actor_emb_dim', 512),
-                n_layers=len(config.get('actor_hidden_dims', (512, 512, 512, 512))),
-                timestep_emb_dim=config.get('time_encoder_dim', 128),
-                disable_time_embedding=config.get('disable_time_embedding', False),
-                dropout=config.get('dropout', 0.1),
-            )
-            # One-step actor (same architecture)
-            actor_onestep = MLP(
                 act_dim=action_dim,
                 Ta=horizon_length,
                 obs_dim=network_input_dim,
@@ -989,32 +728,8 @@ class FQLAgent:
                 dropout=config.get('dropout', 0.1),
                 expansion_factor=config.get('expansion_factor', 1),
             )
-            actor_onestep = VanillaMLP(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                emb_dim=config.get('actor_emb_dim', 512),
-                n_layers=len(config.get('actor_hidden_dims', (512, 512, 512, 512))),
-                dropout=config.get('dropout', 0.1),
-                expansion_factor=config.get('expansion_factor', 1),
-            )
         elif network_type == 'chiunet':
             actor = ChiUNet(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                emb_dim=config.get('model_dim', 256),
-                kernel_size=config.get('kernel_size', 5),
-                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
-                timestep_emb_params=config.get('timestep_emb_params', None),
-                cond_predict_scale=config.get('cond_predict_scale', True),
-                obs_as_global_cond=config.get('obs_as_global_cond', True),
-                dim_mult=config.get('dim_mult', [1, 2]),
-                disable_time_embedding=config.get('disable_time_embedding', False),
-            )
-            actor_onestep = ChiUNet(
                 act_dim=action_dim,
                 Ta=horizon_length,
                 obs_dim=network_input_dim,
@@ -1043,33 +758,8 @@ class FQLAgent:
                 p_drop_attn=config.get('p_drop_attn', 0.3),
                 n_cond_layers=config.get('n_cond_layers', 0),
             )
-            actor_onestep = ChiTransformer(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                d_model=config.get('d_model', 256),
-                nhead=config.get('nhead', 4),
-                num_layers=config.get('num_layers', 8),
-                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
-                timestep_emb_params=config.get('timestep_emb_params', None),
-                p_drop_emb=config.get('p_drop_emb', 0.0),
-                p_drop_attn=config.get('p_drop_attn', 0.3),
-                n_cond_layers=config.get('n_cond_layers', 0),
-            )
         elif network_type == 'jannerunet':
             actor = JannerUNet(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                emb_dim=config.get('model_dim', 256),
-                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
-                timestep_emb_params=config.get('timestep_emb_params', None),
-                norm_type=config.get('unet_norm_type', 'groupnorm'),
-                attention=config.get('attention', False),
-            )
-            actor_onestep = JannerUNet(
                 act_dim=action_dim,
                 Ta=horizon_length,
                 obs_dim=network_input_dim,
@@ -1094,31 +784,9 @@ class FQLAgent:
                 max_freq=config.get('max_freq', 100.0),
                 dropout=config.get('dropout', 0.1),
             )
-            actor_onestep = RNN(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                rnn_hidden_dim=config.get('emb_dim', 256),
-                rnn_num_layers=config.get('n_layers', 2),
-                rnn_type=config.get('rnn_type', 'LSTM'),
-                timestep_emb_dim=config.get('timestep_emb_dim', 128),
-                max_freq=config.get('max_freq', 100.0),
-                dropout=config.get('dropout', 0.1),
-            )
         elif network_type == 'vanillarnn':
             from utils.networks import VanillaRNN
             actor = VanillaRNN(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                rnn_hidden_dim=config.get('emb_dim', 256),
-                rnn_num_layers=config.get('n_layers', 2),
-                rnn_type=config.get('rnn_type', 'LSTM'),
-                dropout=config.get('dropout', 0.1),
-            )
-            actor_onestep = VanillaRNN(
                 act_dim=action_dim,
                 Ta=horizon_length,
                 obs_dim=network_input_dim,
@@ -1141,70 +809,17 @@ class FQLAgent:
                 dropout=config.get('dropout', 0.0),
                 timestep_emb_type=config.get('timestep_emb_type', 'positional'),
             )
-            actor_onestep = DiT(
-                act_dim=action_dim,
-                Ta=horizon_length,
-                obs_dim=network_input_dim,
-                To=config['To'],
-                d_model=config.get('emb_dim', 384),
-                n_heads=config.get('n_heads', 6),
-                depth=config.get('n_layers', 12),
-                dropout=config.get('dropout', 0.0),
-                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
-            )
         else:
             raise ValueError(f"Unknown network type: {network_type}. Supported: mlp, vanillamlp, chiunet, chitransformer, jannerunet, rnn, vanillarnn, dit")
 
         print(f"✓ Created policy network: {network_type}")
-
+        onestep_actor = copy.deepcopy(actor)
         # ===== Create FlowMap and Interpolant =====
         flow_map = FlowMap(actor)
-        flow_map_onestep = FlowMap(actor_onestep)
+        one_step_flow_map = FlowMap(onestep_actor)
         interpolant = Interpolant(interp_type=config.get('interp_type', 'linear'))
         print(f"✓ Created FlowMap with {config.get('interp_type', 'linear')} interpolant")
 
-        # ===== Create Critic Encoder (separate from actor encoder) =====
-        if encoder_type == 'identity':
-            critic_encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
-        elif encoder_type == 'mlp':
-            critic_encoder = MLPEncoder(
-                obs_dim=config['obs_dim'],
-                emb_dim=emb_dim,
-                To=config['To'],
-                hidden_dims=config.get('encoder_hidden_dims', [256, 256]),
-                dropout=config.get('encoder_dropout', 0.25),
-            )
-        elif encoder_type == 'image':
-            critic_encoder = MultiImageObsEncoder(
-                shape_meta=config['shape_meta'],
-                rgb_model_name=config.get('rgb_model_name', 'resnet18'),
-                emb_dim=emb_dim,
-                resize_shape=config.get('resize_shape', None),
-                crop_shape=config.get('crop_shape', None),
-                random_crop=config.get('random_crop', True),
-                use_group_norm=config.get('use_group_norm', True),
-                share_rgb_model=config.get('share_rgb_model', False),
-                imagenet_norm=config.get('imagenet_norm', False),
-                use_seq=(config['To'] > 1),
-                keep_horizon_dims=True,
-                pretrained=config.get('pretrained_encoder', True),
-                freeze_rgb_encoder=config.get('freeze_encoder', True),
-            )
-        elif encoder_type == 'impala':
-            from utils.encoders import ImpalaEncoder
-            if is_visual:
-                input_shape = observation_shape if not is_multi_image else (3, 84, 84)
-                critic_encoder = ImpalaEncoder(
-                    input_shape=input_shape,
-                    width=1,
-                    stack_sizes=(16, 32, 32),
-                    num_blocks=2,
-                    mlp_hidden_dims=(emb_dim,),
-                )
-            else:
-                critic_encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
-        else:
-            raise ValueError(f"Unknown encoder type: {encoder_type}")
 
         # ===== Create Critic =====
         full_action_dim = action_dim * horizon_length if config.get('action_chunking', True) else action_dim
@@ -1224,146 +839,147 @@ class FQLAgent:
         lr = config.get('lr', 1e-4)
         weight_decay = config.get('weight_decay', 1e-5)
 
-        # Collect parameters for actor optimizer (includes both actors and encoder)
-        actor_params = list(actor.parameters()) + list(actor_onestep.parameters())
-        if encoder is not None:
-            encoder_params = [p for p in encoder.parameters() if p.requires_grad]
-            actor_params += encoder_params
-
-            # Print parameter counts
-            total_encoder_params = sum(p.numel() for p in encoder.parameters())
-            trainable_encoder_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
-            if trainable_encoder_params < total_encoder_params:
-                print(f"  Encoder: {trainable_encoder_params:,} / {total_encoder_params:,} parameters trainable "
-                      f"({100 * trainable_encoder_params / total_encoder_params:.1f}%)")
-
+        # Collect parameters for actor optimizer (includes encoder and flow_map)
+        # Only include parameters that require gradients (exclude frozen encoder)
+        actor_params = list(actor.parameters())
+        onestep_actor_params = list(onestep_actor.parameters())
         # Collect parameters for critic optimizer
         critic_params = list(critic.parameters())
-        if critic_encoder is not None:
-            critic_encoder_params = [p for p in critic_encoder.parameters() if p.requires_grad]
-            critic_params += critic_encoder_params
 
         # Always use AdamW with weight_decay (aligned with mip/config.py)
         actor_optimizer = optim.AdamW(actor_params, lr=lr, weight_decay=weight_decay)
+        onestep_actor_optimizer = optim.AdamW(onestep_actor_params, lr=lr, weight_decay=weight_decay)
         critic_optimizer = optim.AdamW(critic_params, lr=lr, weight_decay=weight_decay)
 
         return cls(
             actor=actor,
-            actor_onestep=actor_onestep,
             critic=critic,
+            onestep_actor=onestep_actor,
             target_critic=target_critic,
             actor_optimizer=actor_optimizer,
             critic_optimizer=critic_optimizer,
+            onestep_actor_optimizer=onestep_actor_optimizer,
             config=config,
             encoder=encoder,
-            critic_encoder=critic_encoder,
             flow_map=flow_map,
-            flow_map_onestep=flow_map_onestep,
+            one_step_flow_map=one_step_flow_map,
             interpolant=interpolant,
         )
 
 
 def get_config():
-    """Get default configuration for FQL agent (ml_collections.ConfigDict)."""
+    """Get default configuration for BC agent (ml_collections.ConfigDict).
+
+    Aligned with /home/xukainan/much-ado-about-noising/mip/config.py
+    """
     import ml_collections
     return ml_collections.ConfigDict(
         dict(
-            agent_name='fql',
-            lr=1e-4,  # Learning rate (aligned with mip/config.py)
-            batch_size=1024,  # Batch size (aligned with mip/config.py)
-            weight_decay=1e-5,  # Weight decay (aligned with mip/config.py)
+            agent_name='acfql',  # Agent name
 
-            # New parameters from mip/config.py
-            grad_clip_norm=10.0,  # Gradient clipping norm
-            ema_rate=0.995,  # EMA rate for model averaging
-            loss_scale=100.0,  # Loss scaling factor
+            # ===== Optimization Config (aligned with mip/config.py OptimizationConfig) =====
+            lr=1e-4,
+            weight_decay=1e-5,
+            batch_size=1024,
+            grad_clip_norm=10.0,
+            ema_rate=0.995,
+            loss_scale=100.0,
             norm_type='l2',  # 'l2' or 'l1'
+            interp_type='linear',  # 'linear' or 'trig'
+            discount=0.99,
 
-            # Encoder configuration
-            encoder='mlp',  # Encoder type: 'identity', 'mlp', 'image', 'impala'
-            obs_type='state',  # Observation type: 'state', 'image', 'keypoint'
-            emb_dim=256,  # Encoder output dimension
-            encoder_hidden_dims=[256, 256],  # For MLP encoder
-            encoder_dropout=0.25,  # Encoder dropout
+            # ===== Network Config (aligned with mip/config.py NetworkConfig) =====
+            network_type='mlp',  # 'mlp', 'vanillamlp', 'chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit'
+            n_layers=4,
+            emb_dim=512,
+            dropout=0.1,
+            encoder_dropout=0.0,
+            expansion_factor=4,
+            timestep_emb_dim=128,
+            timestep_emb_type='positional',  # 'positional', 'sinusoidal', 'fourier'
 
-            # Image encoder specific
-            rgb_model_name='resnet18',  # ResNet model: 'resnet18', 'resnet34', 'resnet50'
-            pretrained_encoder=True,  # Load pretrained ImageNet weights
-            freeze_encoder=True,  # Freeze encoder parameters (only train MLP projection)
-            resize_shape=None,  # Optional image resize (H, W)
-            crop_shape=None,  # Optional crop for augmentation (H, W)
-            random_crop=True,  # Enable random crop augmentation
-            share_rgb_model=False,  # Share encoder across multiple cameras
-            use_group_norm=True,  # Use GroupNorm in ResNet
-            imagenet_norm=False,  # Use ImageNet normalization
+            # State encoder configs
+            num_encoder_layers=2,
+            encoder_hidden_dims=[256, 256],
 
-            # Network configuration
-            network_type='mlp',  # Network: 'mlp', 'vanillamlp', 'chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit'
-            n_layers=4,  # Number of layers (aligned with mip/config.py)
-            actor_hidden_dims=(512, 512, 512, 512),
-            value_hidden_dims=(512, 512, 512, 512),
-            layer_norm=True,
-            actor_layer_norm=False,
-            expansion_factor=4,  # Expansion factor for MLP (aligned with mip/config.py)
+            # Image encoder configs
+            rgb_model_name='resnet18',
+            use_seq=True,
+            keep_horizon_dims=True,
+            pretrained_encoder=True,
+            freeze_encoder=True,
+            resize_shape=None,
+            crop_shape=None,
+            random_crop=True,
+            use_group_norm=True,
+            share_rgb_model=False,
+            imagenet_norm=False,
 
-            # ChiUNet-specific
-            model_dim=256,
-            kernel_size=5,
-            cond_predict_scale=True,
-            obs_as_global_cond=True,
-            dim_mult=[1, 2],
-
-            # ChiTransformer-specific
+            # Transformer specific configs
+            n_heads=6,
+            n_cond_layers=0,
+            attn_dropout=0.1,
             d_model=256,
             nhead=4,
             num_layers=8,
             p_drop_emb=0.0,
             p_drop_attn=0.3,
-            n_cond_layers=0,
 
-            # JannerUNet-specific
+            # UNet specific configs
+            model_dim=256,
+            kernel_size=5,
+            cond_predict_scale=True,
+            obs_as_global_cond=True,
+            dim_mult=[1, 2],
             unet_norm_type='groupnorm',
             attention=False,
 
-            # RNN-specific
+            # RNN specific configs
             rnn_type='LSTM',  # 'LSTM' or 'GRU'
             max_freq=100.0,
 
-            # DiT-specific
-            n_heads=6,
+            # ===== Task Config =====
+            horizon_length=16,  # Action prediction horizon (Ta)
+            To=1,  # Observation steps
+            action_dim=7,  # Will be set by create()
+            obs_dim=23,  # Will be set by create()
+            action_chunking=True,
 
-            # Time embedding
-            time_encoder='sinusoidal',  # Time encoder: None, 'sinusoidal', 'fourier', 'positional'
-            time_encoder_dim=64,  # Time embedding dimension
-            timestep_emb_type='positional',  # For U-Net/Transformer networks
-            timestep_emb_params=None,
-            timestep_emb_dim=128,
-            disable_time_embedding=False,
-            use_fourier_features=False,  # Legacy parameter
-            fourier_feature_dim=64,  # Legacy parameter
+            # ===== Encoder Config =====
+            encoder='mlp',  # 'identity', 'mlp', 'image', 'impala'
+            obs_type='state',  # 'state', 'image'
 
-            # Training
-            discount=0.99,
+            # ===== Other =====
+            device='cuda',
+            use_compile=True,
+            compile_mode='default',
+            use_dataloader=True,
+
+            # Critic (for future RL)
+            bc_weight=1.0,
             tau=0.005,
+            q_agg='min',
             num_qs=2,
+            value_hidden_dims=(512, 512, 512, 512),
+            layer_norm=True,
+
+            # Flow sampling
             flow_steps=10,
 
-            # Action chunking
-            horizon_length=16,
-            action_chunking=True,
-            obs_steps=1,  # Observation context length
+            # Loss type configuration
+            loss_type='flow',  # 'flow', 'regression', 'tsd', 'mip', 'lmd', 'ctm', 'psd', 'lsd', 'esd', 'mf'
+            t_two_step=0.9,  # For tsd/mip loss
+            discrete_dt=0.01,  # For ctm loss
 
-            # Compilation and optimization
-            use_compile=True,  # Enable torch.compile for faster training
-            compile_mode='default',  # Compile mode: 'default', 'reduce-overhead', 'max-autotune'
-            use_dataloader=True,  # Use PyTorch DataLoader for multi-process data loading
-
-            # FQL specific
-            bc_weight=1.0,
-            alpha=100.0,
-            q_agg='mean',  # Q aggregation method (min or mean)
-
-            # Flow matching
-            interp_type='linear',  # Interpolation type: 'linear' or 'trig'
+            # Legacy parameters (for compatibility)
+            actor_hidden_dims=(512, 512, 512, 512),
+            actor_emb_dim=512,
+            actor_layer_norm=True,
+            time_encoder='sinusoidal',
+            time_encoder_dim=64,
+            timestep_emb_params=None,
+            disable_time_embedding=False,
+            use_fourier_features=False,
+            fourier_feature_dim=64,
         )
     )

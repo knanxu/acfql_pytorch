@@ -375,25 +375,18 @@ def main(_):
             size=FLAGS.offline_steps * config['batch_size']  # Virtual size
         )
 
-        # Determine number of workers based on observation type
-        if is_image_env:
-            num_workers = 8  # More workers for image data
-        else:
-            num_workers = 4  # Fewer workers for state data
-
         dataloader = torch.utils.data.DataLoader(
             seq_dataset,
             batch_size=config['batch_size'],
-            num_workers=num_workers,
+            num_workers=0,  # 单进程，避免 HDF5/robosuite 多进程冲突导致 segfault
             shuffle=True,
-            pin_memory=True,  # Faster CPU->GPU transfer
-            persistent_workers=True,  # Keep workers alive
-            drop_last=True,  # Required for consistent batch sizes (helps with compile)
+            pin_memory=False,
+            drop_last=True,
         )
 
         # Create infinite iterator
         data_iterator = loop_dataloader(dataloader)
-        print(f"DataLoader created with {num_workers} workers, batch_size={config['batch_size']}")
+        print(f"DataLoader created with single-process loading, batch_size={config['batch_size']}")
     else:
         data_iterator = None
         print("Using manual sampling (no DataLoader)")

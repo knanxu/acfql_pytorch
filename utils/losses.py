@@ -87,6 +87,7 @@ def flow_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    valid: torch.Tensor | None = None,
 ) -> float:
     """Flow model loss, matching the velocity field.
 
@@ -96,6 +97,8 @@ def flow_loss(
         obs (torch.Tensor): the target state
         obs (torch.Tensor): the label
         delta_t (torch.Tensor): the time step difference, used for flow map / shortcut model / consistency training only.
+        valid (torch.Tensor | None): optional validity mask of shape (B, T) for action chunking.
+            When provided, invalid timesteps (where valid=0) are excluded from the loss.
 
     Returns:
         float: the loss
@@ -113,8 +116,15 @@ def flow_loss(
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
     b_t = flow_map.get_velocity(t, act_t, obs_emb)
 
-    # compute loss
-    loss = get_norm(b_t - act_t_dot, config.norm_type) ** 2
+    # compute loss - shape: (B, T, act_dim) after squaring
+    error = b_t - act_t_dot
+    loss = error ** 2
+
+    # Apply valid mask if provided
+    if valid is not None:
+        # valid: (B, T) -> (B, T, 1) to broadcast with (B, T, act_dim)
+        loss = loss * valid[..., None]
+
     loss = config.loss_scale * torch.mean(loss)
     return loss, {}
 
@@ -127,8 +137,14 @@ def regression_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    valid: torch.Tensor | None = None,
 ) -> float:
-    """Standard regression loss."""
+    """Standard regression loss.
+
+    Args:
+        valid (torch.Tensor | None): optional validity mask of shape (B, T) for action chunking.
+            When provided, invalid timesteps (where valid=0) are excluded from the loss.
+    """
     # sample
     t = torch.zeros_like(delta_t, device=delta_t.device)
     act_0 = torch.zeros_like(act, device=act.device)
@@ -139,8 +155,15 @@ def regression_loss(
     # predict
     act_pred = flow_map.get_velocity(t, act_0, obs_emb)
 
-    # compute loss
-    loss = get_norm(act_pred - act, config.norm_type) ** 2
+    # compute loss - shape: (B, T, act_dim)
+    error = act_pred - act
+    loss = error ** 2
+
+    # Apply valid mask if provided
+    if valid is not None:
+        # valid: (B, T) -> (B, T, 1) to broadcast with (B, T, act_dim)
+        loss = loss * valid[..., None]
+
     loss = config.loss_scale * torch.mean(loss)
     return loss, {}
 
@@ -559,8 +582,14 @@ def mf_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    valid: torch.Tensor | None = None,
 ) -> float:
-    """Mean flow loss."""
+    """Mean flow loss.
+
+    Args:
+        valid (torch.Tensor | None): optional validity mask of shape (B, T) for action chunking.
+            When provided, invalid timesteps (where valid=0) are excluded from the loss.
+    """
     # ========== Flow matching loss ==========
     # sample
     act_0 = torch.empty_like(act).normal_(0, 1)
@@ -599,8 +628,16 @@ def mf_loss(
         # t_diff = (t - s).view(-1, 1, 1) if act_0.ndim == 3 else (t - s).view(-1, 1)
         u_tgt = dot_Is + t_diff * (ds_xst + grad_xst_b)
     error = u_xst - u_tgt
-    mf_term = get_norm(error, config.norm_type) ** 2
-    mf_term = config.loss_scale * torch.mean(mf_term)
+
+    # compute loss - shape: (B, T, act_dim)
+    loss = error ** 2
+
+    # Apply valid mask if provided
+    if valid is not None:
+        # valid: (B, T) -> (B, T, 1) to broadcast with (B, T, act_dim)
+        loss = loss * valid[..., None]
+
+    mf_term = config.loss_scale * torch.mean(loss)
 
     # combine losses
     total_loss = mf_term
@@ -617,8 +654,14 @@ def imf_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    valid: torch.Tensor | None = None,
 ) -> float:
-    """improved Mean flow loss."""
+    """improved Mean flow loss.
+
+    Args:
+        valid (torch.Tensor | None): optional validity mask of shape (B, T) for action chunking.
+            When provided, invalid timesteps (where valid=0) are excluded from the loss.
+    """
     # ========== Flow matching loss ==========
     # sample
     act_0 = torch.empty_like(act).normal_(0, 1)
@@ -657,8 +700,16 @@ def imf_loss(
     t_diff = at_least_ndim(t_diff,act_1.dim())
     vs = u_xst - t_diff * (duds + grad_xst_b )
     error = vs - (act_1 - act_0)
-    imf_term = get_norm(error, config.norm_type) ** 2
-    imf_term = config.loss_scale * torch.mean(imf_term)
+
+    # compute loss - shape: (B, T, act_dim)
+    loss = error ** 2
+
+    # Apply valid mask if provided
+    if valid is not None:
+        # valid: (B, T) -> (B, T, 1) to broadcast with (B, T, act_dim)
+        loss = loss * valid[..., None]
+
+    imf_term = config.loss_scale * torch.mean(loss)
 
     # combine losses
     total_loss = imf_term

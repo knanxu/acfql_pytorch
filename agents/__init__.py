@@ -12,7 +12,7 @@ All agents use dict-based config (similar to JAX version).
 from agents.fbc import BCAgent, get_config as fbc_get_config
 from agents.mfbc import MFBCAgent, get_config as mfbc_get_config
 from agents.imfbc import IMFBCAgent, get_config as imfbc_get_config
-from agents.fql import FQLAgent, get_config as fql_get_config
+from agents.fql import ACFQLAgent, get_config as fql_get_config
 
 # Agent registry: name -> (AgentClass, get_config_fn)
 # All agents use dict-based config (no ConfigClass)
@@ -20,7 +20,7 @@ agents = dict(
     fbc=(BCAgent, fbc_get_config),
     mfbc=(MFBCAgent, mfbc_get_config),
     imfbc=(IMFBCAgent, imfbc_get_config),
-    fql=(FQLAgent, fql_get_config),
+    fql=(ACFQLAgent, fql_get_config),
 )
 
 

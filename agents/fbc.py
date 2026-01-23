@@ -54,7 +54,6 @@ class BCAgent:
         critic_optimizer: optim.Optimizer,
         config: Dict[str, Any],
         encoder: Optional[nn.Module] = None,
-        critic_encoder: Optional[nn.Module] = None,
         flow_map: Optional[FlowMap] = None,
         interpolant: Optional[Interpolant] = None,
     ):
@@ -79,7 +78,6 @@ class BCAgent:
         self.critic_optimizer = critic_optimizer
         self.config = config
         self.encoder = encoder
-        self.critic_encoder = critic_encoder
 
         # Flow matching components
         self.flow_map = flow_map
@@ -93,8 +91,6 @@ class BCAgent:
         self.target_critic.to(self.device)
         if self.encoder is not None:
             self.encoder.to(self.device)
-        if self.critic_encoder is not None:
-            self.critic_encoder.to(self.device)
         if self.flow_map is not None:
             self.flow_map.to(self.device)
 
@@ -187,6 +183,11 @@ class BCAgent:
         # Create delta_t tensor for loss function
         delta_t = torch.ones(batch_size, device=self.device)
 
+        # Extract valid mask if present (for action chunking)
+        valid = batch.get('valid', None)
+        if valid is not None:
+            valid = torch.as_tensor(valid, device=self.device, dtype=torch.float32)
+
         # Call unified loss function
         bc_flow_loss, loss_info = self.loss_fn(
             config=self.opt_config,
@@ -196,6 +197,7 @@ class BCAgent:
             act=batch_actions,
             obs=obs_for_encoder,
             delta_t=delta_t,
+            valid=valid,
         )
 
         total_loss = self.config.get('bc_weight', 1.0) * bc_flow_loss
@@ -207,6 +209,10 @@ class BCAgent:
         # Add any additional info from loss function
         for k, v in loss_info.items():
             info[k] = v
+
+        # Log valid mask statistics if present
+        if valid is not None:
+            info['valid_ratio'] = valid.mean().item()
 
         return total_loss, info
     
@@ -382,7 +388,14 @@ class BCAgent:
 
         # Ensure actions are in (B, T, act_dim) format for flow_map
         if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
-            actions = noises  # Already (B, T, act_dim)
+            # Ensure noises has correct shape (B, T, act_dim)
+            if noises.ndim == 2:
+                # Could be (B, T*act_dim) flat format, reshape it
+                actions = noises.reshape(batch_size, horizon_length, action_dim)
+            elif noises.ndim == 3:
+                actions = noises  # Already (B, T, act_dim)
+            else:
+                raise ValueError(f"Unexpected noises shape: {noises.shape}")
         else:
             # MLP-based policy - reshape to (B, T, act_dim)
             actions = noises.reshape(batch_size, horizon_length, action_dim)
@@ -754,48 +767,7 @@ class BCAgent:
         interpolant = Interpolant(interp_type=config.get('interp_type', 'linear'))
         print(f"✓ Created FlowMap with {config.get('interp_type', 'linear')} interpolant")
 
-        # ===== Create Critic Encoder (separate from actor encoder) =====
-        if encoder_type == 'identity':
-            critic_encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
-        elif encoder_type == 'mlp':
-            critic_encoder = MLPEncoder(
-                obs_dim=config['obs_dim'],
-                emb_dim=emb_dim,
-                To=config['To'],
-                hidden_dims=config.get('encoder_hidden_dims', [256, 256]),
-                dropout=config.get('encoder_dropout', 0.25),
-            )
-        elif encoder_type == 'image':
-            critic_encoder = MultiImageObsEncoder(
-                shape_meta=config['shape_meta'],
-                rgb_model_name=config.get('rgb_model_name', 'resnet18'),
-                emb_dim=emb_dim,
-                resize_shape=config.get('resize_shape', None),
-                crop_shape=config.get('crop_shape', None),
-                random_crop=config.get('random_crop', True),
-                use_group_norm=config.get('use_group_norm', True),
-                share_rgb_model=config.get('share_rgb_model', False),
-                imagenet_norm=config.get('imagenet_norm', False),
-                use_seq=(config['To'] > 1),
-                keep_horizon_dims=True,
-                pretrained=config.get('pretrained_encoder', True),
-                freeze_rgb_encoder=config.get('freeze_encoder', True),
-            )
-        elif encoder_type == 'impala':
-            from utils.encoders import ImpalaEncoder
-            if is_visual:
-                input_shape = observation_shape if not is_multi_image else (3, 84, 84)
-                critic_encoder = ImpalaEncoder(
-                    input_shape=input_shape,
-                    width=1,
-                    stack_sizes=(16, 32, 32),
-                    num_blocks=2,
-                    mlp_hidden_dims=(emb_dim,),
-                )
-            else:
-                critic_encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
-        else:
-            raise ValueError(f"Unknown encoder type: {encoder_type}")
+       
 
         # ===== Create Critic =====
         full_action_dim = action_dim * horizon_length if config.get('action_chunking', True) else action_dim
@@ -804,7 +776,6 @@ class BCAgent:
             action_dim=full_action_dim,
             hidden_dim=config.get('value_hidden_dims', (512, 512, 512, 512)),
             num_ensembles=config.get('num_qs', 2),
-            encoder=None,  # Encoder is separate
             layer_norm=config.get('layer_norm', True),
         )
 
@@ -818,22 +789,11 @@ class BCAgent:
         # Collect parameters for actor optimizer (includes encoder and flow_map)
         # Only include parameters that require gradients (exclude frozen encoder)
         actor_params = list(actor.parameters())
-        if encoder is not None:
-            encoder_params = [p for p in encoder.parameters() if p.requires_grad]
-            actor_params += encoder_params
-
-            # Print parameter counts
-            total_encoder_params = sum(p.numel() for p in encoder.parameters())
-            trainable_encoder_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
-            if trainable_encoder_params < total_encoder_params:
-                print(f"  Encoder: {trainable_encoder_params:,} / {total_encoder_params:,} parameters trainable "
-                      f"({100 * trainable_encoder_params / total_encoder_params:.1f}%)")
+       
 
         # Collect parameters for critic optimizer
         critic_params = list(critic.parameters())
-        if critic_encoder is not None:
-            critic_encoder_params = [p for p in critic_encoder.parameters() if p.requires_grad]
-            critic_params += critic_encoder_params
+        
 
         # Always use AdamW with weight_decay (aligned with mip/config.py)
         actor_optimizer = optim.AdamW(actor_params, lr=lr, weight_decay=weight_decay)
@@ -847,7 +807,6 @@ class BCAgent:
             critic_optimizer=critic_optimizer,
             config=config,
             encoder=encoder,
-            critic_encoder=critic_encoder,
             flow_map=flow_map,
             interpolant=interpolant,
         )
