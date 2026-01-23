@@ -655,7 +655,8 @@ def imf_loss(
     # t_diff = (t - s).view(-1, 1, 1) if act_0.ndim == 3 else (t - s).view(-1, 1)
     t_diff = t-s
     t_diff = at_least_ndim(t_diff,act_1.dim())
-    error = u_xst - t_diff * (grad_xst_b + duds)
+    vs = u_xst - t_diff * (duds + grad_xst_b )
+    error = vs - (act_1 - act_0)
     imf_term = get_norm(error, config.norm_type) ** 2
     imf_term = config.loss_scale * torch.mean(imf_term)
 
